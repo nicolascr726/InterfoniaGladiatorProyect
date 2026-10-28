@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "297733501497",
+    "project_id": "citofono-e2a73",
+    "storage_bucket": "citofono-e2a73.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:297733501497:android:1a108e5cf5d390bc7953e8",
+        "android_client_info": {
+          "package_name": "com.example.citofono"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDehd4UjVyuWnfAklqQdwnKFfOmLSXP2h4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:297733501497:android:03206cccf81f7adb7953e8",
+        "android_client_info": {
+          "package_name": "com.gladiator.interfonia"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDehd4UjVyuWnfAklqQdwnKFfOmLSXP2h4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

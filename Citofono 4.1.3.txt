@@ -1,0 +1,1772 @@
+/////////////////////////////////////////////////////////////////
+/*
+  ESP32-S3 + INMP441 + UDA1334A + Botón Físico GPIO 1 + GPIO 2 (Alerta) + Video Backend
+  Gladiator Control citofono - VERSIÓN BOTÓN ÚNICO (16KHz + Anti-Bucle)
+  + COMANDOS DE PRUEBA LOCAL (TEST_INCOMING, TEST_ACCEPT, etc.)
+*/
+/////////////////////////////////////////////////////////////////
+
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#define ARDUINOJSON_USE_LONG_LONG 1
+#include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <string.h>
+
+#define I2S_SD       10
+#define I2S_WS       11
+#define I2S_SCK      12
+#define I2S_DOUT     13
+#define I2S_PORT     I2S_NUM_0
+
+// === CONFIGURACIÓN DE AUDIO Y VOLUMEN ===
+#define SPEAKER_GAIN         2.0     // Ganancia de audio de la bocina (bájamelo o súbelo si es necesario)
+#define RING_TONE_AMPLITUDE  9000    // Volumen del ring-ring (antes 28000, ajústalo aquí si lo quieres más bajo o alto)
+
+// === BOTONES FÍSICOS Y LED ===
+#define BUTTON_PIN     1      // GPIO 1 conectado al botón principal (a GND)
+#define BUTTON_PIN_2   2      // GPIO 2 conectado al botón de alerta (a GND)
+#define DOOR_BUTTON_1  4      // GPIO 4 conectado al botón de Apertura Puerta 1 (a GND)
+#define DOOR_BUTTON_2  5      // GPIO 5 conectado al botón de Apertura Puerta 2 (a GND)
+#define LED_NOTICE_PIN 19      // GPIO 19 conectado al LED indicador de aviso
+
+// Variables para el control del LED (Enclavado y Parpadeo)
+bool ledEnclavado = false;
+unsigned long lastLedBlinkTime = 0;
+bool ledBlinkState = false;
+
+// === CORRECCIÓN DE FRECUENCIAS UNIFICADAS ===
+#define AUDIO_SAMPLE_RATE 16000   // Hardware sincronizado a 16kHz para la APK
+#define NET_SAMPLE_RATE   16000   // Red sincronizada a 16kHz
+#define DMA_BUF_COUNT     8       // Más buffers para evitar que el audio se corte
+#define DMA_BUF_LEN       256     // Tamaño de buffer optimizado para 16kHz
+
+#define MONO_SAMPLES       128
+
+#define RX_FRAME_SAMPLES      160
+#define RX_FRAME_BYTES        (RX_FRAME_SAMPLES * 2)
+#define RX_DAC_SAMPLES        (RX_FRAME_SAMPLES * 2)
+
+#define TX_I2S_SAMPLES        640
+#define TX_NET_SAMPLES        (TX_I2S_SAMPLES / 2)
+
+#define APP_TX_AUDIO_VOLUME_Q8 2560
+
+#define RX_RING_SIZE 8192
+#define RX_TARGET_BUFFER_BYTES (RX_FRAME_BYTES * 4)
+#define RX_TRIM_BUFFER_BYTES   (RX_FRAME_BYTES * 6)
+
+const char* DEFAULT_WIFI_SSID = "Wifi_Mesh-8390ACB7";
+const char* DEFAULT_WIFI_PASS = "aGUzw6nR";
+
+// === CONFIGURACIÓN DE MÚLTIPLES REDES (FAILOVER) ===
+const char* ssid_list[] = {"Wifi_Mesh-8390ACB7", "neneduende", "AndroidAP_5939"};
+const char* password_list[] = {"aGUzw6nR", "hola12345", "7c85f8205823"};
+const int total_networks = 2;
+const unsigned long wifi_timeout = 10000; // Tiempo máximo por red (10 segundos)
+
+Preferences wifiPrefs;
+String wifiSsid = "";
+String wifiPass = "";
+volatile bool wifiReconnectRequested = false;
+
+const char* BACKEND_BASE_URL = "https://video.gladiatorcontrolbase.com";
+const char* WS_TX_URL = "ws://209.46.126.62:6666/esp32_tx";
+const char* WS_RX_URL = "ws://209.46.126.62:6666/esp32_rx";
+
+// Configuración Backend Alerta Chat
+const char* BACKEND_HOST  = "209.46.126.62";
+const int   BACKEND_PORT  = 6666;
+const char* DEVICE_RUT    = "99999999";
+
+const char* CALL_TARGET_RUT = "11111111";
+const char* CALLER_RUT = DEVICE_RUT;
+const char* CALLER_DPTO = "Citofono #1";
+const char* HISTORY_RUT = DEVICE_RUT;
+const char* ESP32_DEVICE_ID = "citofono-1";
+
+#define HTTP_TIMEOUT_MS 6000
+#define WS_RECONNECT_MS 2000
+#define ESP32_POLL_MS 500
+#define EMERGENCIA_POLL_MS 2000
+
+using namespace websockets;
+
+WebsocketsClient wsTxClient;
+WebsocketsClient wsRxClient;
+
+volatile bool wsTxConnected = false;
+volatile bool wsRxConnected = false;
+volatile bool wsTxCloseRequested = false;
+volatile bool callWanted = false;
+volatile bool callActive = false;
+volatile bool incomingRinging = false;
+volatile bool wifiConnecting = false;
+
+String currentCallId = "";
+String currentPeerRut = "";
+String currentPeerDpto = "";
+
+unsigned long lastTxReconnectAttempt = 0;
+unsigned long lastRxReconnectAttempt = 0;
+unsigned long lastStats = 0;
+unsigned long callStartedAt = 0;
+unsigned long lastEsp32Poll = 0;
+unsigned long lastEmergenciaPoll = 0;
+
+uint8_t rxRing[RX_RING_SIZE];
+volatile size_t rxHead = 0;
+volatile size_t rxTail = 0;
+portMUX_TYPE ringMux = portMUX_INITIALIZER_UNLOCKED;
+
+int16_t dacStereo[MONO_SAMPLES * 2];
+
+static int16_t i2sTxStereoFrame[TX_I2S_SAMPLES * 2];
+static int16_t micTxMonoFrame[TX_NET_SAMPLES];
+
+static uint8_t rxFrameMonoBytes[RX_FRAME_BYTES];
+static int16_t dacStereoFrame[RX_DAC_SAMPLES * 2];
+
+volatile uint32_t wsRxBytes = 0;
+volatile uint32_t dacWrittenBytes = 0;
+volatile uint32_t wsTxBytes = 0;
+volatile uint32_t droppedRxBytes = 0;
+volatile uint32_t rxUnderruns = 0;
+volatile uint32_t txReadShorts = 0;
+volatile uint32_t txReadErrors = 0;
+volatile uint32_t txSendFails = 0;
+
+void ringClear();
+void closeAudioSockets();
+void connectWiFi();
+void loadWiFiConfig();
+void requestWiFiReconnect();
+void handlePendingWiFiReconnect();
+bool handleWifiCommand(String line);
+void processButtonOrCmdLine(String line);
+void pollBackendCallState();
+void pollBackendEmergencyState();
+
+// === RECEPCIÓN DE AVISOS DESDE LA APP ===
+const bool RX_AVISOS_EN_REPOSO = true;
+const char AVISO_APP_PREFIX[] = "[AVISO APP CITOFONIA] ";
+
+portMUX_TYPE avisoMux = portMUX_INITIALIZER_UNLOCKED;
+bool avisoLedPendiente = false;
+bool avisoTonoPendiente = false;
+
+// Estado independiente: los avisos normales nunca activan el timbre de emergencia.
+const char EMERGENCIA_APP_PREFIX[] = "[EMERGENCIA APP CITOFONIA] ";
+portMUX_TYPE emergenciaMux = portMUX_INITIALIZER_UNLOCKED;
+bool emergenciaActiva = false;
+char emergenciaId[65] = "";
+int64_t emergenciaRevision = -1;
+uint32_t emergenciaDeadline = 0;
+uint32_t emergenciaGeneracion = 0;
+
+bool emergenciaEnCurso(uint32_t* generacion) {
+  const uint32_t ahora = (uint32_t)millis();
+  portENTER_CRITICAL(&emergenciaMux);
+  // La diferencia con signo sigue siendo válida al desbordar millis().
+  if (emergenciaActiva && (int32_t)(ahora - emergenciaDeadline) >= 0) {
+    emergenciaActiva = false;
+    emergenciaGeneracion++;
+  }
+  bool activa = emergenciaActiva;
+  if (generacion != nullptr) *generacion = emergenciaGeneracion;
+  portEXIT_CRITICAL(&emergenciaMux);
+  return activa;
+}
+
+bool aplicarEstadoEmergencia(JsonObjectConst estado, uint32_t demoraMs) {
+  if (!estado["type"].is<const char*>() ||
+      strcmp(estado["type"].as<const char*>(), "emergency") != 0 ||
+      !estado["active"].is<bool>() || !estado["revision"].is<int64_t>() ||
+      !estado["remaining_ms"].is<uint32_t>()) return false;
+
+  const bool solicitada = estado["active"].as<bool>();
+  const int64_t revision = estado["revision"].as<int64_t>();
+  const char* id = estado["id"].is<const char*>() ? estado["id"].as<const char*>() : "";
+  const size_t longitudId = strlen(id);
+  if (revision < 0 || longitudId >= sizeof(emergenciaId) ||
+      (solicitada && longitudId == 0)) return false;
+
+  uint32_t restante = estado["remaining_ms"].as<uint32_t>();
+  if (restante > 60000UL) restante = 60000UL;
+  // Una respuesta HTTP demorada no extiende la vigencia indicada por el servidor.
+  restante = restante > demoraMs ? restante - demoraMs : 0;
+  const uint32_t ahora = (uint32_t)millis();
+
+  portENTER_CRITICAL(&emergenciaMux);
+  if (emergenciaActiva && (int32_t)(ahora - emergenciaDeadline) >= 0) {
+    emergenciaActiva = false;
+    emergenciaGeneracion++;
+  }
+  const bool mismoId = strcmp(emergenciaId, id) == 0;
+  if (revision < emergenciaRevision || (revision == emergenciaRevision && !mismoId)) {
+    portEXIT_CRITICAL(&emergenciaMux);
+    return false;
+  }
+
+  const bool estabaActiva = emergenciaActiva;
+  if (solicitada && restante > 0) {
+    const uint32_t candidata = ahora + restante;
+    if (!mismoId) {
+      emergenciaActiva = true;
+      emergenciaDeadline = candidata;
+    } else if (emergenciaActiva && (int32_t)(candidata - emergenciaDeadline) < 0) {
+      // Duplicados y consultas pueden acortar, pero nunca alargar el plazo.
+      emergenciaDeadline = candidata;
+    }
+    // El mismo ID ya cerrado o vencido se conserva como marca de cierre.
+  } else {
+    emergenciaActiva = false;
+  }
+  if (estabaActiva != emergenciaActiva || (!mismoId && emergenciaActiva)) {
+    emergenciaGeneracion++;
+  }
+  memcpy(emergenciaId, id, longitudId + 1);
+  emergenciaRevision = revision;
+  portEXIT_CRITICAL(&emergenciaMux);
+  return true;
+}
+
+void recibirEstadoEmergenciaJSON(const String& payload, uint32_t demoraMs) {
+  StaticJsonDocument<768> doc;
+  if (deserializeJson(doc, payload)) return;
+  JsonObjectConst estado = doc.as<JsonObjectConst>();
+  if (doc["emergencia"].is<JsonObjectConst>()) {
+    if (!doc["success"].is<bool>() || !doc["success"].as<bool>()) return;
+    estado = doc["emergencia"].as<JsonObjectConst>();
+  }
+  aplicarEstadoEmergencia(estado, demoraMs);
+}
+
+// Controla la activación del LED enclavado al recibir aviso
+void manejarAvisoPendiente() {
+  portENTER_CRITICAL(&avisoMux);
+  bool activarLed = avisoLedPendiente;
+  avisoLedPendiente = false;
+  portEXIT_CRITICAL(&avisoMux);
+
+  if (!activarLed) return;
+
+  ledEnclavado = true; // Enclava el LED fijo
+  Serial.println("[LED] Aviso recibido de la App: LED enclavado.");
+}
+
+// Tono del aviso con un búfer propio.
+void reproducirTonoAvisoAPI() {
+  int16_t avisoStereoFrame[RX_DAC_SAMPLES * 2];
+
+  for (int i = 0; i < RX_DAC_SAMPLES; i++) {
+    int16_t sample = ((i / 12) % 2 == 0) ? 14000 : -14000;
+    avisoStereoFrame[i * 2] = sample;
+    avisoStereoFrame[i * 2 + 1] = sample;
+  }
+
+  for (int b = 0; b < 8; b++) {
+    size_t written = 0;
+    i2s_write(
+      I2S_PORT,
+      avisoStereoFrame,
+      sizeof(avisoStereoFrame),
+      &written,
+      pdMS_TO_TICKS(6)
+    );
+  }
+}
+
+bool isNetworkConnected() {
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+struct SolicitudPuerta {
+  uint8_t puerta;
+  unsigned long creadaEn;
+};
+
+QueueHandle_t colaPuertas = nullptr;
+const unsigned long PUERTA_SOLICITUD_MAX_MS = 5000;
+
+String upperTrim(String s) {
+  s.trim();
+  s.replace("\r", "");
+  s.replace("\n", "");
+  s.trim();
+  s.toUpperCase();
+  return s;
+}
+
+String jsonEscape(const char* text) {
+  String out;
+  if (!text) return out;
+  while (*text) {
+    char c = *text++;
+    if (c == '"') out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+String jsonStringValue(const String &json, const String &key) {
+  String needle = String("\"") + key + "\"";
+  int p = json.indexOf(needle);
+  if (p < 0) return "";
+  p = json.indexOf(':', p + needle.length());
+  if (p < 0) return "";
+  p++;
+  while (p < (int)json.length() && (json[p] == ' ' || json[p] == '\t')) p++;
+  if (p >= (int)json.length()) return "";
+  if (json[p] == 'n') return "";
+  if (json[p] != '\"') return "";
+  p++;
+  String out;
+  bool esc = false;
+  for (; p < (int)json.length(); p++) {
+    char c = json[p];
+    if (esc) { out += c; esc = false; }
+    else if (c == '\\') { esc = true; }
+    else if (c == '\"') { break; }
+    else { out += c; }
+  }
+  return out;
+}
+
+void clearCallIdentity() {
+  currentCallId = "";
+  currentPeerRut = "";
+  currentPeerDpto = "";
+}
+
+void setAudioCallStartFlags() {
+  ringClear();
+  lastTxReconnectAttempt = millis() - WS_RECONNECT_MS;
+  lastRxReconnectAttempt = millis() - WS_RECONNECT_MS;
+  callWanted = true;
+  callStartedAt = millis();
+}
+
+void stopLocalCall(bool notify) {
+  (void)notify;
+  ringClear();
+  incomingRinging = false;
+  callWanted = false;
+  callActive = false;
+  callStartedAt = 0;
+  closeAudioSockets();
+  i2s_zero_dma_buffer(I2S_PORT);
+  clearCallIdentity();
+}
+
+size_t alignRxFrame(size_t n) {
+  return ((n + RX_FRAME_BYTES - 1) / RX_FRAME_BYTES) * RX_FRAME_BYTES;
+}
+
+size_t ringAvailableUnsafe() {
+  if (rxHead >= rxTail) return rxHead - rxTail;
+  return RX_RING_SIZE - rxTail + rxHead;
+}
+
+size_t ringAvailable() {
+  portENTER_CRITICAL(&ringMux);
+  size_t n = ringAvailableUnsafe();
+  portEXIT_CRITICAL(&ringMux);
+  return n;
+}
+
+size_t ringFreeUnsafe() {
+  return RX_RING_SIZE - 1 - ringAvailableUnsafe();
+}
+
+void ringDropOldestAlignedUnsafe(size_t len) {
+  size_t available = ringAvailableUnsafe();
+  if (available == 0) return;
+  len = alignRxFrame(len);
+  if (len > available) len = available - (available % RX_FRAME_BYTES);
+  if (len == 0) return;
+  rxTail = (rxTail + len) % RX_RING_SIZE;
+  droppedRxBytes += len;
+}
+
+bool ringPushKeepNewestAligned(const uint8_t* data, size_t len) {
+  len -= (len % 2);
+  if (len == 0) return false;
+  if (len >= RX_RING_SIZE) {
+    size_t keep = RX_RING_SIZE - RX_FRAME_BYTES;
+    keep -= keep % RX_FRAME_BYTES;
+    data += (len - keep);
+    len = keep;
+  }
+  portENTER_CRITICAL(&ringMux);
+  size_t freeBytes = ringFreeUnsafe();
+  if (len > freeBytes) ringDropOldestAlignedUnsafe(len - freeBytes);
+  for (size_t i = 0; i < len; i++) {
+    rxRing[rxHead] = data[i];
+    rxHead = (rxHead + 1) % RX_RING_SIZE;
+  }
+  size_t available = ringAvailableUnsafe();
+  if (available > RX_TRIM_BUFFER_BYTES) {
+    size_t drop = available - RX_TARGET_BUFFER_BYTES;
+    drop -= (drop % RX_FRAME_BYTES);
+    ringDropOldestAlignedUnsafe(drop);
+  }
+  portEXIT_CRITICAL(&ringMux);
+  return true;
+}
+
+size_t ringPop(uint8_t* out, size_t maxLen) {
+  portENTER_CRITICAL(&ringMux);
+  size_t available = ringAvailableUnsafe();
+  size_t n = (available < maxLen) ? available : maxLen;
+  n -= (n % 2);
+  for (size_t i = 0; i < n; i++) {
+    out[i] = rxRing[rxTail];
+    rxTail = (rxTail + 1) % RX_RING_SIZE;
+  }
+  portEXIT_CRITICAL(&ringMux);
+  return n;
+}
+
+void ringClear() {
+  portENTER_CRITICAL(&ringMux);
+  rxHead = 0;
+  rxTail = 0;
+  portEXIT_CRITICAL(&ringMux);
+}
+
+void trimRxLatencyIfNeeded() {
+  portENTER_CRITICAL(&ringMux);
+  size_t available = ringAvailableUnsafe();
+  if (available > RX_TRIM_BUFFER_BYTES) {
+    size_t drop = available - RX_TARGET_BUFFER_BYTES;
+    drop -= (drop % RX_FRAME_BYTES);
+    ringDropOldestAlignedUnsafe(drop);
+  }
+  portEXIT_CRITICAL(&ringMux);
+}
+
+bool httpRequest(const String &url, const String &method, const String &body, String &response, int &statusCode) {
+  if (!isNetworkConnected()) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) { statusCode = -1; return false; }
+  if (method == "POST") {
+    http.addHeader("Content-Type", "application/json");
+    statusCode = http.POST(body);
+  } else {
+    statusCode = http.GET();
+  }
+  response = http.getString();
+  http.end();
+  return statusCode >= 200 && statusCode < 300;
+}
+
+bool postJson(const String &path, const String &body, String &response, int &statusCode) {
+  return httpRequest(String(BACKEND_BASE_URL) + path, "POST", body, response, statusCode);
+}
+
+bool getPath(const String &path, String &response, int &statusCode) {
+  return httpRequest(String(BACKEND_BASE_URL) + path, "GET", "", response, statusCode);
+}
+
+void pollBackendEmergencyState() {
+  if (!isNetworkConnected()) return;
+  const uint32_t inicio = (uint32_t)millis();
+  String response;
+  int code = 0;
+  if (getPath("/api/emergencias/estado?formato=esp32", response, code)) {
+    recibirEstadoEmergenciaJSON(response, (uint32_t)millis() - inicio);
+  }
+}
+
+String getActiveWifiSsid() {
+  if (wifiSsid.length() > 0) return wifiSsid;
+  return String(DEFAULT_WIFI_SSID);
+}
+
+String getActiveWifiPass() {
+  if (wifiSsid.length() > 0) return wifiPass;
+  return String(DEFAULT_WIFI_PASS);
+}
+
+void loadWiFiConfig() {
+  wifiPrefs.begin("wifi", true);
+  String savedSsid = wifiPrefs.getString("ssid", "");
+  String savedPass = wifiPrefs.getString("pass", "");
+  wifiPrefs.end();
+  savedSsid.trim();
+  if (savedSsid.length() > 0) {
+    wifiSsid = savedSsid;
+    wifiPass = savedPass;
+    Serial.print("[WIFI] Red guardada: ");
+    Serial.println(wifiSsid);
+  } else {
+    wifiSsid = "";
+    wifiPass = "";
+    Serial.print("[WIFI] Usando default: ");
+    Serial.println(DEFAULT_WIFI_SSID);
+  }
+}
+
+bool saveWiFiConfig(String ssid, String pass) {
+  ssid.trim(); pass.trim();
+  if (ssid.length() == 0) {
+    Serial.println("[WIFI] ERROR: SSID vacio");
+    return false;
+  }
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("pass", pass);
+  wifiPrefs.end();
+  wifiSsid = ssid;
+  wifiPass = pass;
+  Serial.print("[WIFI] Guardada: ");
+  Serial.println(wifiSsid);
+  return true;
+}
+
+void clearWiFiConfig() {
+  wifiPrefs.begin("wifi", false);
+  wifiPrefs.remove("ssid");
+  wifiPrefs.remove("pass");
+  wifiPrefs.end();
+  wifiSsid = "";
+  wifiPass = "";
+  Serial.println("[WIFI] Borrada. Usando default.");
+}
+
+void requestWiFiReconnect() { wifiReconnectRequested = true; }
+
+void printWiFiStatus() {
+  Serial.println("========== RED STATUS ==========");
+  Serial.print("SSID Actual: "); Serial.println(WiFi.SSID());
+  Serial.print("Estado: "); Serial.println(WiFi.status() == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+  }
+  Serial.println("=================================");
+}
+
+void printWiFiHelp() {
+  Serial.println("Comandos disponibles:");
+  Serial.println("  LLAMAR | CONTESTAR | COLGAR | ALERTA");
+  Serial.println("  TEST_INCOMING | TEST_ACCEPT | TEST_REJECT | TEST_END");
+  Serial.println("  SET_WIFI:SSID:CLAVE | WIFI_JSON:{\"ssid\":\"SSID\",\"pass\":\"CLAVE\"}");
+  Serial.println("  WIFI_STATUS | WIFI_RECONNECT | WIFI_RESET | STATUS");
+}
+
+bool parseSetWifiCommand(const String &line, String &ssid, String &pass) {
+  const String prefix = "SET_WIFI:";
+  if (!line.startsWith(prefix)) return false;
+  String payload = line.substring(prefix.length());
+  int sep = payload.indexOf(':');
+  if (sep < 0) return true;
+  ssid = payload.substring(0, sep);
+  pass = payload.substring(sep + 1);
+  ssid.trim(); pass.trim();
+  return true;
+}
+
+bool parseWifiJsonCommand(const String &line, String &ssid, String &pass) {
+  const String prefix = "WIFI_JSON:";
+  if (!line.startsWith(prefix)) return false;
+  String json = line.substring(prefix.length());
+  ssid = jsonStringValue(json, "ssid");
+  pass = jsonStringValue(json, "pass");
+  ssid.trim(); pass.trim();
+  return true;
+}
+
+bool handleWifiCommand(String line) {
+  line.trim();
+  if (line.length() == 0) return false;
+  String upper = upperTrim(line);
+
+  if (upper == "WIFI_HELP") { printWiFiHelp(); return true; }
+  if (upper == "WIFI_STATUS") { printWiFiStatus(); return true; }
+  if (upper == "WIFI_RECONNECT") { requestWiFiReconnect(); return true; }
+  if (upper == "WIFI_RESET") { clearWiFiConfig(); requestWiFiReconnect(); return true; }
+
+  String ssid, pass;
+  if (parseSetWifiCommand(line, ssid, pass) || parseWifiJsonCommand(line, ssid, pass)) {
+    if (ssid.length() == 0) return true;
+    if (saveWiFiConfig(ssid, pass)) requestWiFiReconnect();
+    return true;
+  }
+  return false;
+}
+
+void handlePendingWiFiReconnect() {
+  if (!wifiReconnectRequested) return;
+  if (callWanted || incomingRinging) return;
+  wifiReconnectRequested = false;
+  Serial.println("[WIFI] Reconectando...");
+  wsRxConnected = false;
+  wsTxCloseRequested = true;
+  WiFi.disconnect(true);
+  delay(250);
+  connectWiFi();
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  wifiConnecting = true;
+  
+  // Limpiar estado previo para evitar errores de config superpuesta
+  WiFi.disconnect(true, true);
+  delay(500);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  // Si el usuario configuró una red personalizada por preferencias, intentarla primero
+  if (wifiSsid.length() > 0) {
+    Serial.print("[WIFI] Intentando red guardada: "); Serial.println(wifiSsid);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < wifi_timeout) {
+      delay(250); Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("WiFi conectado. IP: "); Serial.println(WiFi.localIP());
+      wifiConnecting = false;
+      return;
+    }
+    Serial.println("[WIFI] Falló red guardada.");
+    
+    WiFi.disconnect(true, true);
+    delay(500);
+  }
+
+  // Recorrido de la lista de respaldo (Failover automático)
+  for (int i = 0; i < total_networks; i++) {
+    Serial.printf("[WIFI] Intentando red de lista [%d]: %s\n", i, ssid_list[i]);
+    WiFi.begin(ssid_list[i], password_list[i]);
+
+    unsigned long start_time = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start_time < wifi_timeout) {
+      delay(250);
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WIFI] ¡Conectado exitosamente a la red!");
+      Serial.print("Dirección IP: ");
+      Serial.println(WiFi.localIP());
+      wifiConnecting = false;
+      return;
+    } else {
+      Serial.printf("[WIFI] Falló la conexión con %s\n", ssid_list[i]);
+      WiFi.disconnect(true, true);
+      delay(500);
+    }
+  }
+
+  Serial.println("[WIFI] Error crítico: No se pudo conectar a ninguna red Wi-Fi.");
+  wifiConnecting = false;
+}
+
+void onTxEventsCallback(WebsocketsEvent event, String data) {
+  (void)data;
+  if (event == WebsocketsEvent::ConnectionOpened) { Serial.println("[WS TX] Abierto"); wsTxConnected = true; }
+  else if (event == WebsocketsEvent::ConnectionClosed) { Serial.println("[WS TX] Cerrado"); wsTxConnected = false; }
+}
+
+void onRxEventsCallback(WebsocketsEvent event, String data) {
+  (void)data;
+  if (event == WebsocketsEvent::ConnectionOpened) { Serial.println("[WS RX] Abierto"); wsRxConnected = true; }
+  else if (event == WebsocketsEvent::ConnectionClosed) { Serial.println("[WS RX] Cerrado"); wsRxConnected = false; }
+}
+
+void onRxMessageCallback(WebsocketsMessage message) {
+  // Los avisos llegan como texto WebSocket.
+  if (message.isText()) {
+    String texto = message.data();
+
+    if (texto.startsWith(EMERGENCIA_APP_PREFIX)) {
+      recibirEstadoEmergenciaJSON(texto.substring(sizeof(EMERGENCIA_APP_PREFIX) - 1), 0);
+    } else if (texto.startsWith(AVISO_APP_PREFIX)) {
+      portENTER_CRITICAL(&avisoMux);
+      avisoLedPendiente = true;
+      avisoTonoPendiente = true;
+      portEXIT_CRITICAL(&avisoMux);
+
+      Serial.print("[AVISO APP] ");
+      Serial.println(
+        texto.substring(sizeof(AVISO_APP_PREFIX) - 1)
+      );
+    }
+
+    // Ningún mensaje de texto debe entrar al búfer de audio.
+    return;
+  }
+
+  // Mantener el procesamiento original del audio durante llamadas.
+  if (!message.isBinary() || !callWanted) return;
+
+  std::string raw = message.rawData();
+  if (raw.empty()) return;
+  
+  if (callWanted && !callActive) {
+    callActive = true;
+    Serial.println("[CALL] LLAMADA ACTIVA CONECTADA");
+  }
+  wsRxBytes += raw.size();
+  if (emergenciaEnCurso(nullptr)) return; // La voz sigue llegando, sin acumularla durante la sirena.
+  ringPushKeepNewestAligned((const uint8_t*)raw.data(), raw.size());
+}
+
+void solicitarAperturaPuerta(uint8_t puerta) {
+  if (puerta != 1 && puerta != 2) return;
+
+  if (!isNetworkConnected() || colaPuertas == nullptr) {
+    Serial.println("[PUERTAS] No se puede enviar: sin WiFi o sin cola.");
+    return;
+  }
+
+  SolicitudPuerta solicitud = {puerta, millis()};
+
+  if (xQueueSend(colaPuertas, &solicitud, 0) != pdPASS) {
+    Serial.println("[PUERTAS] Cola llena. Solicitud descartada.");
+    return;
+  }
+
+  Serial.printf("[PUERTAS] Solicitud en cola: puerta %u\n", puerta);
+}
+
+void procesarSolicitudesPuertas() {
+  if (!wsTxConnected || colaPuertas == nullptr) return;
+
+  SolicitudPuerta solicitud;
+  if (xQueueReceive(colaPuertas, &solicitud, 0) != pdPASS) return;
+
+  if (millis() - solicitud.creadaEn > PUERTA_SOLICITUD_MAX_MS) {
+    Serial.println("[PUERTAS] Solicitud vencida. Vuelve a pulsar.");
+    return;
+  }
+
+  StaticJsonDocument<192> doc;
+  doc["device_id"] = ESP32_DEVICE_ID;
+  doc["accion"] = "abrir";
+  doc["puerta"] = solicitud.puerta;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  if (wsTxClient.send(payload)) {
+    Serial.print("[PUERTAS] Solicitud enviada: ");
+    Serial.println(payload);
+  } else {
+    Serial.println("[PUERTAS] No se pudo confirmar el envio.");
+  }
+}
+
+void onTxMessageCallback(WebsocketsMessage message) {
+  if (!message.isText()) return;
+
+  Serial.print("[PUERTAS] Respuesta del servidor: ");
+  Serial.println(message.data());
+}
+
+void setupWebSockets() {
+  wsTxClient.onEvent(onTxEventsCallback);
+  wsTxClient.onMessage(onTxMessageCallback);
+  wsRxClient.onEvent(onRxEventsCallback);
+  wsRxClient.onMessage(onRxMessageCallback);
+  wsTxClient.setInsecure();
+  wsRxClient.setInsecure();
+}
+
+void connectWsTx() {
+  if (!isNetworkConnected() || wsTxConnected) return;
+  Serial.print("[WS TX] Conectando... ");
+  String url = String(WS_TX_URL) + "?device_id=" + ESP32_DEVICE_ID + "&rut_usuario=" + DEVICE_RUT;
+  bool ok = wsTxClient.connect(url);
+  if (!ok) {Serial.println("FALLO"); wsTxConnected = false; }
+}
+
+void connectWsRx() {
+  if ((!callWanted && !RX_AVISOS_EN_REPOSO) || wsRxConnected) return;
+  Serial.print("[WS RX] Conectando... ");
+  String url = String(WS_RX_URL) + "?device_id=" + ESP32_DEVICE_ID + "&rut_usuario=" + DEVICE_RUT;
+  bool ok = wsRxClient.connect(url);
+  if (!ok) { Serial.println("FALLO"); wsRxConnected = false; }
+}
+
+void closeAudioSockets() {
+  if (RX_AVISOS_EN_REPOSO) return;
+
+  if (wsRxConnected) {
+    wsRxClient.close();
+  }
+  wsRxConnected = false;
+}
+
+void beginIncomingCallFromBackend(const String &response) {
+  if (callWanted || callActive) return;
+
+  String callId = jsonStringValue(response, "call_id");
+  String callerRut = jsonStringValue(response, "caller_rut");
+  String callerDpto = jsonStringValue(response, "caller_dpto");
+
+  if (callId.length() == 0) return;
+  if (currentCallId == callId && incomingRinging) return;
+
+  currentCallId = callId;
+  currentPeerRut = callerRut;
+  currentPeerDpto = callerDpto.length() ? callerDpto : callerRut;
+  incomingRinging = true;
+  callWanted = false;
+  callActive = false;
+  callStartedAt = 0;
+  ringClear();
+
+  Serial.print("[CALL] *** LLAMADA ENTRANTE call_id=");
+  Serial.print(currentCallId);
+  Serial.print(" caller=");
+  Serial.println(currentPeerDpto);
+}
+
+void acceptIncomingCallOnBackend() {
+  if (!incomingRinging || currentCallId.length() == 0) return;
+
+  String body = String("{") +
+    "\"call_id\":\"" + currentCallId + "\"," +
+    "\"device_id\":\"" + ESP32_DEVICE_ID + "\"" +
+    "}";
+
+  String response;
+  int code = 0;
+  bool ok = postJson("/api/esp32/answer-call", body, response, code);
+
+  Serial.print("[CALL] POST /api/esp32/answer-call code=");
+  Serial.print(code); Serial.print(" ok="); Serial.println(ok ? "true" : "false");
+
+  String callId = jsonStringValue(response, "call_id");
+  if (callId.length() > 0) currentCallId = callId;
+
+  if (!ok) { stopLocalCall(true); return; }
+
+  incomingRinging = false;
+  setAudioCallStartFlags();
+  callActive = true;
+  Serial.println("[CALL] INICIAR LLAMADA");
+}
+
+void rejectIncomingCallOnBackend() {
+  if (!incomingRinging) return;
+  String body = String("{") +
+    "\"call_id\":\"" + currentCallId + "\"," +
+    "\"device_id\":\"" + ESP32_DEVICE_ID + "\"" +
+    "}";
+  String response; int code = 0;
+  postJson("/api/esp32/reject-call", body, response, code);
+  stopLocalCall(true);
+}
+
+void handleRemoteCallEnded(const String &response) {
+  String endedCallId = jsonStringValue(response, "call_id");
+  if (currentCallId.length() && endedCallId.length() && endedCallId != currentCallId) return;
+  Serial.println("[CALL] Backend indica fin/cancelacion remota");
+  stopLocalCall(true);
+}
+
+void pollBackendCallState() {
+  if (!isNetworkConnected()) return;
+  
+  if (callWanted && !wsRxConnected && !wsTxConnected) {
+     return; 
+  }
+
+  // Una respuesta lenta no debe alterar una llamada que ya cambio.
+  const String polledCallId = currentCallId;
+  String path = String("/api/esp32/poll?device_id=") + ESP32_DEVICE_ID;
+  if (polledCallId.length() > 0) path += "&call_id=" + polledCallId;
+
+  String response; int code = 0;
+  bool ok = getPath(path, response, code);
+  if (!ok || currentCallId != polledCallId) return;
+
+  String action = jsonStringValue(response, "action");
+
+  if (action == "idle") {
+    if (currentCallId.length() > 0 && (callWanted || callActive || incomingRinging)) {
+      Serial.println("[CALL] Backend sin llamada vigente: liberando estado local.");
+      stopLocalCall(true);
+    }
+    return;
+  }
+
+  if (action == "incoming_call") { beginIncomingCallFromBackend(response); return; }
+  if (action == "active") {
+    if (callWanted && !callActive) {
+      callActive = true;
+      callStartedAt = millis();
+      Serial.println("[CALL] INICIAR LLAMADA DESDE BACKEND");
+    }
+    return;
+  }
+  if (action == "end_call") { handleRemoteCallEnded(response); return; }
+}
+
+void i2s_install() {
+  const i2s_config_t i2s_config = {
+    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX),
+    .sample_rate = AUDIO_SAMPLE_RATE,
+    .bits_per_sample = i2s_bits_per_sample_t(16),
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = DMA_BUF_COUNT,
+    .dma_buf_len = DMA_BUF_LEN,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+}
+
+void i2s_setpin() {
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_DOUT,
+    .data_in_num = I2S_SD
+  };
+  i2s_set_pin(I2S_PORT, &pin_config);
+}
+
+void writeIncomingRingToneFrame() {
+  static uint32_t sampleCounter = 0;
+  bool toneOn = (millis() % 3000UL) < 1000UL;
+  for (int i = 0; i < RX_DAC_SAMPLES; i++) {
+    int16_t sample = 0;
+    // Utiliza la constante RING_TONE_AMPLITUDE definida arriba
+    if (toneOn) sample = ((sampleCounter / 18) % 2 == 0) ? RING_TONE_AMPLITUDE : -RING_TONE_AMPLITUDE; 
+    sampleCounter++;
+    dacStereoFrame[i * 2 + 0] = sample;
+    dacStereoFrame[i * 2 + 1] = sample;
+  }
+  size_t written = 0;
+  esp_err_t err = i2s_write(I2S_PORT, dacStereoFrame, sizeof(dacStereoFrame), &written, pdMS_TO_TICKS(6));
+  if (err == ESP_OK) dacWrittenBytes += written;
+}
+
+// Timbre exclusivo de emergencia: 500 ms de tono y 250 ms de pausa.
+void writeEmergencyRingToneFrame() {
+  static uint32_t sampleCounter = 0;
+  bool toneOn = (millis() % 750UL) < 500UL;
+  for (int i = 0; i < RX_DAC_SAMPLES; i++) {
+    int16_t sample = 0;
+    if (toneOn) sample = ((sampleCounter / 18) % 2 == 0) ? RING_TONE_AMPLITUDE : -RING_TONE_AMPLITUDE;
+    sampleCounter++;
+    dacStereoFrame[i * 2 + 0] = sample;
+    dacStereoFrame[i * 2 + 1] = sample;
+  }
+  size_t written = 0;
+  esp_err_t err = i2s_write(I2S_PORT, dacStereoFrame, sizeof(dacStereoFrame), &written, pdMS_TO_TICKS(6));
+  if (err == ESP_OK) dacWrittenBytes += written;
+}
+
+// === TONO SUAVE Y AGRADABLE PARA BOTÓN LLAMADA (GPIO 1) ===
+void playCallBeep() {
+  for (int b = 0; b < 12; b++) {
+    for (int i = 0; i < RX_DAC_SAMPLES; i++) {
+      int16_t sample = ((i / 32) % 2 == 0) ? 12000 : -12000;
+      dacStereoFrame[i * 2 + 0] = sample;
+      dacStereoFrame[i * 2 + 1] = sample;
+    }
+    size_t written = 0;
+    i2s_write(I2S_PORT, dacStereoFrame, sizeof(dacStereoFrame), &written, pdMS_TO_TICKS(6));
+  }
+}
+
+// === TONO DISTINTO Y SUAVE PARA BOTÓN MENSAJE / ALERTA (GPIO 2) ===
+void playMessageBeep() {
+  for (int b = 0; b < 8; b++) {
+    for (int i = 0; i < RX_DAC_SAMPLES; i++) {
+      int16_t sample = ((i / 12) % 2 == 0) ? 14000 : -14000;
+      dacStereoFrame[i * 2 + 0] = sample;
+      dacStereoFrame[i * 2 + 1] = sample;
+    }
+    size_t written = 0;
+    i2s_write(I2S_PORT, dacStereoFrame, sizeof(dacStereoFrame), &written, pdMS_TO_TICKS(6));
+  }
+}
+
+void audioPlaybackTask(void* parameter) {
+  (void)parameter;
+  bool primed = false;
+  bool emergenciaSonando = false;
+  uint32_t generacionReproducida = 0;
+  const TickType_t framePeriod = pdMS_TO_TICKS(20);
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;) {
+    uint32_t generacion = 0;
+    const bool reproducirEmergencia = emergenciaEnCurso(&generacion);
+    if (reproducirEmergencia != emergenciaSonando || generacion != generacionReproducida) {
+      ringClear();
+      i2s_zero_dma_buffer(I2S_PORT);
+      primed = false;
+      emergenciaSonando = reproducirEmergencia;
+      generacionReproducida = generacion;
+      lastWake = xTaskGetTickCount();
+    }
+    if (reproducirEmergencia) {
+      writeEmergencyRingToneFrame();
+      vTaskDelayUntil(&lastWake, framePeriod);
+      continue;
+    }
+
+    bool emitirTonoAviso = false;
+
+    if (!callWanted && !callActive && !incomingRinging) {
+      portENTER_CRITICAL(&avisoMux);
+      emitirTonoAviso = avisoTonoPendiente;
+      avisoTonoPendiente = false;
+      portEXIT_CRITICAL(&avisoMux);
+    }
+
+    if (emitirTonoAviso) {
+      reproducirTonoAvisoAPI();
+      lastWake = xTaskGetTickCount();
+    }
+
+    if (incomingRinging && !callWanted) {
+      primed = false;
+      writeIncomingRingToneFrame();
+      vTaskDelayUntil(&lastWake, framePeriod);
+      continue;
+    }
+
+    // === TIMBRE DE LLAMADA SALIENTE (RING RING LOCAL) ===
+    if (callWanted && !callActive) {
+      primed = false;
+      writeIncomingRingToneFrame(); 
+      vTaskDelayUntil(&lastWake, framePeriod);
+      continue;
+    }
+
+    if (!callWanted) {
+      primed = false;
+      lastWake = xTaskGetTickCount();
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    trimRxLatencyIfNeeded();
+    size_t available = ringAvailable();
+    if (!primed) {
+      if (available < RX_TARGET_BUFFER_BYTES) {
+        memset(dacStereoFrame, 0, sizeof(dacStereoFrame));
+        size_t written = 0;
+        i2s_write(I2S_PORT, dacStereoFrame, sizeof(dacStereoFrame), &written, pdMS_TO_TICKS(4));
+        if (written > 0) dacWrittenBytes += written;
+        vTaskDelayUntil(&lastWake, framePeriod);
+        continue;
+      }
+      primed = true;
+    }
+    bool haveAudio = false;
+    if (ringAvailable() >= RX_FRAME_BYTES) {
+      size_t n = ringPop(rxFrameMonoBytes, RX_FRAME_BYTES);
+      haveAudio = (n == RX_FRAME_BYTES);
+    }
+    if (!haveAudio) {
+      rxUnderruns++;
+      memset(dacStereoFrame, 0, sizeof(dacStereoFrame));
+    } else {
+      int16_t* mono = (int16_t*)rxFrameMonoBytes;
+      int out = 0;
+      float gain = SPEAKER_GAIN;
+
+      for (int i = 0; i < RX_FRAME_SAMPLES; i++) {
+        int32_t amplified = (int32_t)(mono[i] * gain);
+        
+        if (amplified > 32767) amplified = 32767;
+        if (amplified < -32768) amplified = -32768;
+        
+        int16_t s = (int16_t)amplified;
+
+        dacStereoFrame[out++] = s;
+        dacStereoFrame[out++] = s;
+        dacStereoFrame[out++] = s;
+        dacStereoFrame[out++] = s;
+      }
+    }
+    size_t written = 0;
+    i2s_write(I2S_PORT, dacStereoFrame, sizeof(dacStereoFrame), &written, pdMS_TO_TICKS(6));
+    if (written > 0) dacWrittenBytes += written;
+    vTaskDelayUntil(&lastWake, framePeriod);
+  }
+}
+
+int16_t amplifyAudioForApp(int32_t sample) {
+  sample = (sample * APP_TX_AUDIO_VOLUME_Q8) >> 8;
+  if (sample > 32767) return 32767;
+  if (sample < -32768) return -32768;
+  return (int16_t)sample;
+}
+
+void sendMicToBrowser() {
+  if (!callActive || !wsTxConnected || wsTxCloseRequested) return;
+  size_t bytesIn = 0;
+  esp_err_t result = i2s_read(I2S_PORT, (void*)i2sTxStereoFrame, sizeof(i2sTxStereoFrame), &bytesIn, pdMS_TO_TICKS(80));
+  if (result != ESP_OK) { txReadErrors++; return; }
+  if (bytesIn < sizeof(i2sTxStereoFrame)) { txReadShorts++; return; }
+
+  for (int i = 0; i < TX_NET_SAMPLES; i++) {
+    int32_t a = i2sTxStereoFrame[i * 2 * 2 + 0];
+    int32_t b = i2sTxStereoFrame[(i * 2 + 1) * 2 + 0];
+    int32_t mixed = (a + b) / 2;
+    micTxMonoFrame[i] = amplifyAudioForApp(mixed);
+  }
+  if (!callActive || !wsTxConnected || wsTxCloseRequested) return;
+
+  bool ok = wsTxClient.sendBinary((const char*)micTxMonoFrame, sizeof(micTxMonoFrame));
+  if (ok) { 
+    wsTxBytes += sizeof(micTxMonoFrame); 
+  } else { 
+    txSendFails++; 
+    if (!wsTxClient.available()) {
+      wsTxConnected = false;
+    }
+  }
+}
+
+void audioMicTxTask(void* parameter) {
+  (void)parameter;
+
+  for (;;) {
+    if (!isNetworkConnected() || wsTxCloseRequested) {
+      if (wsTxConnected) { wsTxClient.close(); }
+      wsTxConnected = false;
+      wsTxCloseRequested = false;
+      if (!isNetworkConnected() && colaPuertas != nullptr) { xQueueReset(colaPuertas); }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    if (!wsTxConnected && millis() - lastTxReconnectAttempt > WS_RECONNECT_MS) {
+      lastTxReconnectAttempt = millis();
+      connectWsTx();
+    }
+    if (wsTxConnected) {
+      wsTxClient.poll();
+      procesarSolicitudesPuertas();
+      if (callActive) { sendMicToBrowser(); }
+      wsTxClient.poll();
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+void audioWsRxTask(void* parameter) {
+  (void)parameter;
+  for (;;) {
+    if (!isNetworkConnected() || !callWanted && !RX_AVISOS_EN_REPOSO) {
+      if (wsRxConnected) { wsRxClient.close(); wsRxConnected = false; }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    if (!wsRxConnected && millis() - lastRxReconnectAttempt > WS_RECONNECT_MS) {
+      lastRxReconnectAttempt = millis();
+      connectWsRx();
+    }
+    if (wsRxConnected) wsRxClient.poll();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+void backendPollTask(void* parameter) {
+  (void)parameter;
+  for (;;) {
+    if (isNetworkConnected()) {
+      unsigned long now = millis();
+      if (now - lastEmergenciaPoll >= EMERGENCIA_POLL_MS) {
+        lastEmergenciaPoll = now;
+        pollBackendEmergencyState();
+        now = millis();
+      }
+      if (now - lastEsp32Poll >= ESP32_POLL_MS) {
+        lastEsp32Poll = now;
+        pollBackendCallState();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void startCallFromButton() {
+  Serial.println("[CALL] *** LLAMAR desde botón - INICIANDO ***");
+  playCallBeep();
+
+  incomingRinging = false;
+  clearCallIdentity();
+  currentPeerRut = CALL_TARGET_RUT;
+  currentPeerDpto = "App";
+  setAudioCallStartFlags();
+  callActive = false;
+
+  String body = String("{") +
+    "\"rut\":\"" + jsonEscape(CALL_TARGET_RUT) + "\"," +
+    "\"tipo\":\"audio\"," +
+    "\"caller_rut\":\"" + jsonEscape(CALLER_RUT) + "\"," +
+    "\"caller_dpto\":\"" + jsonEscape(CALLER_DPTO) + "\"," +
+    "\"device_id\":\"" + jsonEscape(ESP32_DEVICE_ID) + "\"" +
+    "}";
+
+  Serial.print("[CALL] POST /llamar body=");
+  Serial.println(body);
+
+  String response;
+  int code = 0;
+  bool ok = postJson("/llamar", body, response, code);
+
+  Serial.print("[CALL] POST /llamar code=");
+  Serial.print(code);
+  Serial.print(" ok=");
+  Serial.println(ok ? "true" : "false");
+  Serial.print("[CALL] Response: ");
+  Serial.println(response);
+
+  if (code == 409) {
+    Serial.println("[CALL] Conserjeria ocupada. Este citofono sigue conectado.");
+    stopLocalCall(false);
+    return;
+  }
+
+  String callId = jsonStringValue(response, "call_id");
+  if (callId.length() > 0) {
+    currentCallId = callId;
+    Serial.print("[CALL] *** call_id obtenido: ");
+    Serial.println(currentCallId);
+  }
+
+  if (!ok) {
+    Serial.println("[CALL] *** POST /llamar FALLO - cancelando ***");
+    stopLocalCall(true);
+  } else {
+    Serial.println("[CALL] *** LLAMAR OK - esperando que backend active ***");
+  }
+}
+
+void endCallFromButton() {
+  Serial.println("[CALL] COLGAR desde botón");
+  if (incomingRinging && !callWanted) { rejectIncomingCallOnBackend(); return; }
+
+  uint32_t duration = 0;
+  if (callStartedAt > 0) duration = (millis() - callStartedAt) / 1000UL;
+
+  String room = currentPeerRut.length() ? currentPeerRut : String(CALL_TARGET_RUT);
+
+  String body = String("{") +
+    "\"call_id\":\"" + currentCallId + "\"," +
+    "\"room\":\"" + room + "\"," +
+    "\"device_id\":\"" + jsonEscape(ESP32_DEVICE_ID) + "\"," +
+    "\"rut_emisor\":\"" + jsonEscape(CALLER_RUT) + "\"," +
+    "\"rut_receptor\":\"" + room + "\"," +
+    "\"tipo_llamada\":\"audio\"," +
+    "\"estado\":\"finalizada\"," +
+    "\"reason\":\"finalizada\"," +
+    "\"duracion_segundos\":" + String(duration) +
+    "}";
+
+  String response; int code = 0;
+  postJson("/api/esp32/end-call", body, response, code);
+  stopLocalCall(false);
+}
+
+void answerIncomingFromButton() {
+  Serial.println("[CALL] CONTESTAR desde botón");
+  if (incomingRinging) {
+    acceptIncomingCallOnBackend();
+    return;
+  }
+  incomingRinging = false;
+  setAudioCallStartFlags();
+  callActive = true;
+}
+
+// === FUNCIÓN API PARA ENVIAR ALERTA / MENSAJE (GPIO 2) CON LED ENCLAVADO ===
+bool apiEnviarAlerta() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  ledEnclavado = true;      // Enclava el LED fijo al enviar la alerta
+  playMessageBeep(); 
+
+  HTTPClient http;
+  String url = "http://" + String(BACKEND_HOST) + ":" + String(BACKEND_PORT) + "/api/chat/messages";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<250> doc;
+  doc["rut_emisor"] = DEVICE_RUT;
+  doc["rut_receptor"] = CALL_TARGET_RUT;
+  doc["mensaje"] = "⚠️ Tienes una alerta del usuario " + String(DEVICE_RUT) + ", por favor llamarlo.";
+
+  String body;
+  serializeJson(doc, body);
+
+  int httpCode = http.POST(body);
+  if (httpCode > 0) {
+    http.getString();
+  }
+  if (httpCode == HTTP_CODE_OK || httpCode == 201) {
+    Serial.println("✅ [HTTP] Alerta enviada al conserje.");
+    http.end();
+    return true;
+  }
+  http.end();
+  return false;
+}
+
+bool apiCrearRecadoDesdeAlerta() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[RECADO] No hay conexión WiFi.");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(BACKEND_HOST) +
+               ":" + String(BACKEND_PORT) + "/api/recados";
+
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  if (!http.begin(url)) {
+    Serial.println("[RECADO] No se pudo iniciar la petición HTTP.");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<512> doc;
+  doc["rut_emisor"] = DEVICE_RUT;
+  doc["origen"] = "citofono";
+  doc["device_id"] = ESP32_DEVICE_ID;
+  doc["titulo"] = "Solicitud de recado del citofono";
+  doc["descripcion"] =
+    "Tienes un recado pendiente del usuario " + String(DEVICE_RUT) + ", por favor llamarlo.";
+
+  String body;
+  serializeJson(doc, body);
+
+  Serial.println("---------- ENVIO DE RECADO ----------");
+  Serial.println("URL enviada: " + url);
+  Serial.println("Datos enviados: " + body);
+
+  int httpCode = http.POST(body);
+  Serial.printf("[RECADO] Codigo HTTP: %d\n", httpCode);
+
+  if (httpCode > 0) {
+    Serial.println("[RECADO] Respuesta: " + http.getString());
+  } else {
+    Serial.println(
+      "[RECADO] Error de conexion: " +
+      HTTPClient::errorToString(httpCode)
+    );
+  }
+
+  bool enviado = (httpCode == HTTP_CODE_OK || httpCode == 201);
+  http.end();
+
+  if (enviado) {
+    Serial.println("[RECADO] Recado pendiente creado correctamente.");
+  } else {
+    Serial.println("[RECADO] No se confirmó la creación del recado.");
+  }
+
+  return enviado;
+}
+
+// === FUNCIONES DE PRUEBA LOCAL (TESTS) ===
+void simulateTestIncomingCall() {
+  if (callWanted || callActive) return;
+  currentCallId = "TEST_CALL_" + String(millis());
+  currentPeerRut = "88888888";
+  currentPeerDpto = "Prueba Local";
+  incomingRinging = true;
+  callWanted = false;
+  callActive = false;
+  ringClear();
+  Serial.println("[TEST] *** LLAMADA ENTRANTE SIMULADA ***");
+}
+
+void simulateTestAcceptCall() {
+  if (!incomingRinging) return;
+  incomingRinging = false;
+  setAudioCallStartFlags();
+  callActive = true;
+  Serial.println("[TEST] *** LLAMADA ENTRANTE ACEPTADA ***");
+}
+
+void simulateTestRejectCall() {
+  if (!incomingRinging) return;
+  Serial.println("[TEST] *** LLAMADA ENTRANTE RECHAZADA ***");
+  stopLocalCall(false);
+}
+
+void simulateTestEndCall() {
+  Serial.println("[TEST] *** LLAMADA FINALIZADA ***");
+  stopLocalCall(false);
+}
+
+// Lógica de acción según el estado actual del citófono al pulsar el botón
+void handleButtonPress() {
+  Serial.println("[BOTON] Presionado GPIO 1");
+  ledEnclavado = false; // Desenclava el LED al presionar el botón principal
+  if (incomingRinging) {
+    answerIncomingFromButton();
+  } else if (callWanted || callActive) {
+    endCallFromButton();
+  } else {
+    startCallFromButton();
+  }
+}
+
+void processButtonOrCmdLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  if (handleWifiCommand(line)) return;
+
+  String cmd = upperTrim(line);
+
+  if (cmd == "LLAMAR") { startCallFromButton(); return; }
+  if (cmd == "COLGAR" || cmd == "FINALIZAR_LLAMADA") { endCallFromButton(); return; }
+  if (cmd == "CONTESTAR") { answerIncomingFromButton(); return; }
+  if (cmd == "ALERTA") { apiEnviarAlerta(); return; }
+
+  // Pruebas directas
+  if (cmd == "TEST_INCOMING") { simulateTestIncomingCall(); return; }
+  if (cmd == "TEST_ACCEPT") { simulateTestAcceptCall(); return; }
+  if (cmd == "TEST_REJECT") { simulateTestRejectCall(); return; }
+  if (cmd == "TEST_END") { simulateTestEndCall(); return; }
+}
+
+void checkButtonPin() {
+  static bool lastState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  static unsigned long pressStartTime = 0;
+  static bool holdTriggered = false;
+  
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > 50) {
+    static bool buttonState = HIGH;
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) {
+        pressStartTime = millis();
+        holdTriggered = false;
+      } else {
+        if (!holdTriggered) {
+          handleButtonPress();
+        }
+      }
+    } else if (buttonState == LOW && !holdTriggered) {
+      if (incomingRinging && (millis() - pressStartTime >= 3000)) {
+        Serial.println("[BOTON] GPIO 1 mantenido 3s -> Rechazando llamada entrante");
+        rejectIncomingCallOnBackend();
+        holdTriggered = true;
+      }
+    }
+  }
+  lastState = reading;
+}
+
+void checkButtonPin2() {
+  static bool lastState2 = HIGH;
+  static unsigned long lastDebounceTime2 = 0;
+  
+  bool reading2 = digitalRead(BUTTON_PIN_2);
+
+  if (reading2 != lastState2) {
+    lastDebounceTime2 = millis();
+  }
+
+  if ((millis() - lastDebounceTime2) > 50) {
+    static bool buttonState2 = HIGH;
+    if (reading2 != buttonState2) {
+      buttonState2 = reading2;
+      if (buttonState2 == LOW) {
+        Serial.println("[BOTON 2] Presionado GPIO 2");
+        if (ledEnclavado) {
+          ledEnclavado = false; // Si ya estaba enclavado, se apaga al presionarlo de nuevo
+          Serial.println("[LED] Desenclavado manualmente con el botón de aviso.");
+        } else {
+          apiEnviarAlerta();           // Envía el mensaje de chat y enclava el LED
+          apiCrearRecadoDesdeAlerta(); // Crea el recado.
+        }
+      }
+    }
+  }
+  lastState2 = reading2;
+}
+
+// === COMPROBACIÓN DE BOTONES DE LAS PUERTAS ===
+void checkDoorButtons() {
+  static bool lastDoor1State = HIGH;
+  static unsigned long lastDebounceDoor1 = 0;
+  bool readingDoor1 = digitalRead(DOOR_BUTTON_1);
+
+  if (readingDoor1 != lastDoor1State) {
+    lastDebounceDoor1 = millis();
+  }
+  if ((millis() - lastDebounceDoor1) > 50) {
+    static bool door1State = HIGH;
+    if (readingDoor1 != door1State) {
+      door1State = readingDoor1;
+      if (door1State == LOW) {
+        Serial.println("[PUERTA 1] Presionado GPIO 21 - Apertura Puerta 1");
+        solicitarAperturaPuerta(1);
+      }
+    }
+  }
+  lastDoor1State = readingDoor1;
+
+  static bool lastDoor2State = HIGH;
+  static unsigned long lastDebounceDoor2 = 0;
+  bool readingDoor2 = digitalRead(DOOR_BUTTON_2);
+
+  if (readingDoor2 != lastDoor2State) {
+    lastDebounceDoor2 = millis();
+  }
+  if ((millis() - lastDebounceDoor2) > 50) {
+    static bool door2State = HIGH;
+    if (readingDoor2 != door2State) {
+      door2State = readingDoor2;
+      if (door2State == LOW) {
+        Serial.println("[PUERTA 2] Presionado GPIO 20 - Apertura Puerta 2");
+        solicitarAperturaPuerta(2);
+      }
+    }
+  }
+  lastDoor2State = readingDoor2;
+}
+
+// === GESTIÓN DEL LED (PARPADEO AL LLAMAR, BUSCANDO RED O FIJO SI ESTÁ ENCLAVADO) ===
+void handleLedControl() {
+  // 1. Prioridad: Parpadeo durante llamadas entrantes, salientes o activas
+  if (callWanted || incomingRinging) {
+    if (millis() - lastLedBlinkTime >= 500) {
+      lastLedBlinkTime = millis();
+      ledBlinkState = !ledBlinkState;
+      digitalWrite(LED_NOTICE_PIN, ledBlinkState ? HIGH : LOW);
+    }
+    return;
+  }
+
+  // 2. Prioridad: Parpadeo rápido (250ms) si está intentando conectar/reconectar al Wi-Fi
+  if (wifiConnecting || !isNetworkConnected()) {
+    if (millis() - lastLedBlinkTime >= 250) {
+      lastLedBlinkTime = millis();
+      ledBlinkState = !ledBlinkState;
+      digitalWrite(LED_NOTICE_PIN, ledBlinkState ? HIGH : LOW);
+    }
+    return;
+  }
+
+  // 3. La emergencia ilumina mientras esté vigente; los avisos conservan su enclavamiento.
+  if (emergenciaEnCurso(nullptr) || ledEnclavado) {
+    digitalWrite(LED_NOTICE_PIN, HIGH);
+    return;
+  }
+
+  // 4. Caso normal: apagado
+  digitalWrite(LED_NOTICE_PIN, LOW);
+}
+
+void handleUsbDebugInput() {
+  static char buf[256];
+  static uint8_t idx = 0;
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      buf[idx] = 0;
+      String line(buf);
+      idx = 0;
+      line.trim();
+      if (line.length() > 0) {
+        String upper = upperTrim(line);
+
+        if (upper == "STATUS") {
+          Serial.println("========== STATUS COMPLETO ==========");
+          Serial.print("Red: "); Serial.println(WiFi.status() == WL_CONNECTED ? "WIFI" : "DESCONECTADO");
+          Serial.print("Call: ");
+          if (callWanted) Serial.println(callActive ? "ACTIVA" : "INICIANDO");
+          else if (incomingRinging) Serial.println("ENTRANTE (sonando)");
+          else Serial.println("IDLE");
+          Serial.print("call_id: "); Serial.println(currentCallId.length() ? currentCallId : "(ninguno)");
+          Serial.print("WS TX: "); Serial.println(wsTxConnected ? "CONECTADO" : "DESCONECTADO");
+          Serial.print("WS RX: "); Serial.println(wsRxConnected ? "CONECTADO" : "DESCONECTADO");
+          Serial.println("=====================================");
+          return;
+        }
+
+        processButtonOrCmdLine(line);
+      }
+    } else if (c == '\r') {
+      // ignore
+    } else {
+      if (idx < sizeof(buf) - 1) buf[idx++] = c;
+      else idx = 0;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN_2, INPUT_PULLUP);
+  pinMode(DOOR_BUTTON_1, INPUT_PULLUP);
+  pinMode(DOOR_BUTTON_2, INPUT_PULLUP);
+  pinMode(LED_NOTICE_PIN, OUTPUT);
+  digitalWrite(LED_NOTICE_PIN, LOW);
+
+  Serial.println("===========================================");
+  Serial.println("GLADIATOR CITOFONO - VERSIÓN BOTÓN GPIO 1 Y GPIO 2");
+  Serial.println("===========================================");
+
+  loadWiFiConfig();
+  connectWiFi();
+  setupWebSockets();
+
+  i2s_install();
+  i2s_setpin();
+  i2s_zero_dma_buffer(I2S_PORT);
+  i2s_start(I2S_PORT);
+
+  colaPuertas = xQueueCreate(4, sizeof(SolicitudPuerta));
+  if (colaPuertas == nullptr) {
+    Serial.println("[PUERTAS] Error al crear la cola.");
+  }
+
+  xTaskCreatePinnedToCore(audioPlaybackTask, "audioPlayback", 4096, NULL, 4, NULL, 0);
+  xTaskCreatePinnedToCore(audioWsRxTask, "audioWsRx", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(audioMicTxTask, "audioMicTx", 6144, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(backendPollTask, "backendPoll", 8192, NULL, 1, NULL, 1);
+
+  Serial.println("\n-------------------------------------------");
+  delay(300);
+  Serial.print("S"); delay(80);
+  Serial.print("i"); delay(80);
+  Serial.print("s"); delay(80);
+  Serial.print("t"); delay(80);
+  Serial.print("e"); delay(80);
+  Serial.print("m"); delay(80);
+  Serial.print("a"); delay(80);
+  Serial.print(" "); delay(80);
+  Serial.print("C"); delay(80);
+  Serial.print("i"); delay(80);
+  Serial.print("t"); delay(80);
+  Serial.print("o"); delay(80);
+  Serial.print("f"); delay(80);
+  Serial.print("o"); delay(80);
+  Serial.print("n"); delay(80);
+  Serial.print("i"); delay(80);
+  Serial.print("a"); delay(80);
+  Serial.print(" "); delay(80);
+  Serial.print("l"); delay(80);
+  Serial.print("i"); delay(80);
+  Serial.print("s"); delay(80);
+  Serial.print("t"); delay(80);
+  Serial.print("o"); delay(80);
+  Serial.print(" "); delay(80);
+  Serial.print("p"); delay(80);
+  Serial.print("a"); delay(80);
+  Serial.print("r"); delay(80);
+  Serial.print("a"); delay(80);
+  Serial.print(" "); delay(80);
+  Serial.print("o"); delay(80);
+  Serial.print("p"); delay(80);
+  Serial.print("e"); delay(80);
+  Serial.print("r"); delay(80);
+  Serial.println("a");
+  delay(400);
+
+  Serial.print("Creado por ");
+  String autor = "Ricardo Morales";
+  for (int i = 0; i < autor.length(); i++) {
+    Serial.print(autor[i]);
+    delay(100);
+  }
+  Serial.println("\n-------------------------------------------\n");
+
+  Serial.println("===========================================");
+  Serial.println("Todos los tasks creados. Audio fijado a 16kHz.");
+  Serial.println("===========================================");
+}
+
+void loop() {
+  handlePendingWiFiReconnect();
+
+  if (!isNetworkConnected()) {
+    wsTxCloseRequested = true;
+    wsRxConnected = false;
+    connectWiFi();
+  }
+
+  manejarAvisoPendiente();
+
+  // Comprobar botones físicos
+  checkButtonPin();
+  checkButtonPin2();
+  checkDoorButtons();
+
+  // Control centralizado del estado del LED
+  handleLedControl();
+
+  handleUsbDebugInput();
+
+  if (millis() - lastStats >= 1000) {
+    uint32_t nowStats = millis();
+    lastStats = nowStats;
+
+    uint32_t rxB = wsRxBytes;
+    uint32_t dacB = dacWrittenBytes;
+    uint32_t txB = wsTxBytes;
+
+    wsRxBytes = 0;
+    dacWrittenBytes = 0;
+    wsTxBytes = 0;
+
+    Serial.print("CALL:");
+    Serial.print(callWanted ? (callActive ? "ACTIVE" : "STARTING") : (incomingRinging ? "INCOMING" : "IDLE"));
+    Serial.print(" | RX:"); Serial.print(rxB);
+    Serial.print(" DAC:"); Serial.print(dacB);
+    Serial.print(" TX:"); Serial.print(txB);
+    Serial.print(" | WS:"); Serial.print(wsTxConnected ? "T" : "t");
+    Serial.println(wsRxConnected ? "R" : "r");
+
+    droppedRxBytes = 0;
+    rxUnderruns = 0;
+    txReadShorts = 0;
+    txReadErrors = 0;
+    txSendFails = 0;
+  }
+
+  delay(1);
+}

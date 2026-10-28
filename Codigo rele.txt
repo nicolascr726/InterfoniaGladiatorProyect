@@ -1,0 +1,346 @@
+/////////////////////////////////////////////////////////////////
+/*
+  ESP32 N.° 2 - Control de Relés Dual (Ethernet W5500 + Wi-Fi)
+  Pines asignados:
+  - W5500: SCK(18), MISO(19), MOSI(23), CS(5), RST(4)
+  - Relés: IN1(26), IN2(27)
+*/
+/////////////////////////////////////////////////////////////////
+
+#include <SPI.h>
+#include <ETH.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+// === CREDENCIALES WI-FI ===
+const char* WIFI_SSID = "Wifi_Mesh-8390ACB7";
+const char* WIFI_PASS = "aGUzw6nR";
+
+// === ASIGNACIÓN DE PINES (según tus imágenes) ===
+const int W5500_CS_PIN  = 5;   // SCS / CS -> GPIO 5
+const int W5500_RST_PIN = 4;   // RST -> GPIO 4
+
+const int RELE1_PIN     = 26;  // IN1 -> GPIO 26 (Puerta 1)
+const int RELE2_PIN     = 27;  // IN2 -> GPIO 27 (Puerta 2)
+
+// === TIEMPOS DE PULSO DE APERTURA POR SEPARADO (Milisegundos) ===
+const unsigned long TIEMPO_PUERTA_1_MS = 2000; // 2 segundos activo
+const unsigned long TIEMPO_PUERTA_2_MS = 3000; // 3 segundos activo (ajusta a tu gusto)
+
+unsigned long rele1TiempoApagado = 0;
+unsigned long rele2TiempoApagado = 0;
+bool rele1Activo = false;
+bool rele2Activo = false;
+
+// Red local y conexion saliente al backend.
+IPAddress ethStaticIp(192, 168, 1, 200);
+IPAddress ethGateway(192, 168, 1, 1);
+IPAddress ethSubnet(255, 255, 255, 0);
+NetworkServer servidorLocal(80);
+const char* WS_PUERTAS_URL =
+  "ws://209.46.126.62:6666/esp32_puertas?device_id=apertura-1";
+
+struct OrdenRele {
+  uint8_t puerta;
+  bool abrir;
+  uint32_t creadaEn;
+};
+QueueHandle_t colaReles = nullptr;
+class TcpBackend : public websockets::network::Esp32TcpClient {
+public:
+  bool connect(const websockets::WSString& host, const int port) override {
+    bool ok = client.connect(host.c_str(), port, 2000);
+    client.setNoDelay(true);
+    return ok;
+  }
+  uint32_t read(uint8_t* buffer, const uint32_t len) override {
+    uint32_t recibidos = 0;
+    uint32_t inicio = millis();
+    while (recibidos < len && client.connected() && millis() - inicio < 1000) {
+      int n = client.read(buffer + recibidos, len - recibidos);
+      if (n > 0) recibidos += n;
+      else vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (recibidos < len) { client.stop(); return 0; }
+    return recibidos;
+  }
+};
+websockets::WebsocketsClient wsPuertas(std::make_shared<TcpBackend>());
+bool wsConectado = false;
+uint32_t ultimoPong = 0;
+
+void activarPuerta1() {
+  digitalWrite(RELE1_PIN, LOW); // Activa el relé (Active-LOW)
+  rele1Activo = true;
+  rele1TiempoApagado = millis() + TIEMPO_PUERTA_1_MS;
+  Serial.printf("[RELÉ] *** PUERTA 1 ACTIVADA (GPIO 26) POR %lu ms ***\n", TIEMPO_PUERTA_1_MS);
+}
+
+void activarPuerta2() {
+  digitalWrite(RELE2_PIN, LOW); // Activa el relé (Active-LOW)
+  rele2Activo = true;
+  rele2TiempoApagado = millis() + TIEMPO_PUERTA_2_MS;
+  Serial.printf("[RELÉ] *** PUERTA 2 ACTIVADA (GPIO 27) POR %lu ms ***\n", TIEMPO_PUERTA_2_MS);
+}
+
+void desactivarPuerta1() {
+  digitalWrite(RELE1_PIN, HIGH);
+  rele1Activo = false;
+  Serial.println("[RELÉ] Puerta 1 desactivada (Cerrada).");
+}
+
+void desactivarPuerta2() {
+  digitalWrite(RELE2_PIN, HIGH);
+  rele2Activo = false;
+  Serial.println("[RELÉ] Puerta 2 desactivada (Cerrada).");
+}
+
+// Control de temporizador no bloqueante (usa millis)
+void revisarTemporizadoresReles() {
+  uint32_t ahora = millis();
+  if (rele1Activo && (int32_t)(ahora - rele1TiempoApagado) >= 0) desactivarPuerta1();
+  if (rele2Activo && (int32_t)(ahora - rele2TiempoApagado) >= 0) desactivarPuerta2();
+}
+
+void conectarWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+bool encolarOrdenRele(uint8_t puerta, bool abrir) {
+  if (puerta != 1 && puerta != 2) return false;
+  OrdenRele orden = {puerta, abrir, millis()};
+  if (colaReles == nullptr || xQueueSend(colaReles, &orden, 0) != pdPASS) {
+    Serial.println("[PUERTAS] Cola llena o no disponible; orden descartada.");
+    return false;
+  }
+  return true;
+}
+
+void recibirOrdenBackend(websockets::WebsocketsMessage mensaje) {
+  if (!mensaje.isText()) return;
+  Serial.print("[BACKEND] ");
+  Serial.println(mensaje.data());
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, mensaje.data())) {
+    Serial.println("[BACKEND] JSON invalido; orden ignorada.");
+    return;
+  }
+  const char* accion = doc["accion"] | "";
+  if (strcmp(accion, "abrir") != 0 || !doc["puerta"].is<int>()) {
+    Serial.println("[BACKEND] Se esperaba accion abrir y puerta numerica 1 o 2.");
+    return;
+  }
+  int puerta = doc["puerta"].as<int>();
+  if (puerta != 1 && puerta != 2) {
+    Serial.println("[BACKEND] Puerta invalida; orden ignorada.");
+    return;
+  }
+  if (encolarOrdenRele((uint8_t)puerta, true)) {
+    Serial.printf("[PUERTAS] Orden recibida para puerta %d.\n", puerta);
+  }
+}
+
+void eventoBackend(websockets::WebsocketsEvent evento, String datos) {
+  (void)datos;
+  if (evento == websockets::WebsocketsEvent::ConnectionOpened) {
+    wsConectado = true;
+    ultimoPong = millis();
+    Serial.println("[BACKEND] WebSocket conectado.");
+  } else if (evento == websockets::WebsocketsEvent::ConnectionClosed) {
+    wsConectado = false;
+    Serial.println("[BACKEND] WebSocket desconectado.");
+  } else if (evento == websockets::WebsocketsEvent::GotPong) {
+    ultimoPong = millis();
+  }
+}
+
+void atenderHttpLocal() {
+  NetworkClient cliente = servidorLocal.accept();
+  if (!cliente) return;
+  String req;
+  uint32_t inicio = millis();
+  while (cliente.connected() && millis() - inicio < 1000) {
+    if (cliente.available()) {
+      req += (char)cliente.read();
+      if (req.length() > 2048) break;
+      if (req.endsWith("\r\n\r\n")) {
+        procesarSolicitudCliente(req, cliente);
+        break;
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+  cliente.stop();
+}
+
+void tareaRedPuertas(void* parametro) {
+  (void)parametro;
+  uint8_t redActual = 0;
+  IPAddress ipActual;
+  uint32_t ultimoIntento = millis() - 5000;
+  uint32_t ultimoIntentoWiFi = millis();
+  uint32_t ultimoPing = millis();
+  uint32_t ultimoFalloEthernet = 0;
+  uint32_t inicioDHCP = millis();
+  bool pausaEthernet = false;
+  bool ipFijaAplicada = false;
+  bool esperandoIpEthernet = false;
+  for (;;) {
+    uint32_t ahora = millis();
+    if (WiFi.status() != WL_CONNECTED && ahora - ultimoIntentoWiFi >= 10000) {
+      ultimoIntentoWiFi = ahora;
+      WiFi.reconnect();
+    }
+    bool enlaceEthernet = ETH.connected();
+    if (enlaceEthernet && !ETH.hasIP()) {
+      if (!esperandoIpEthernet) {
+        esperandoIpEthernet = true;
+        inicioDHCP = ahora;
+        ipFijaAplicada = false;
+      }
+      if (!ipFijaAplicada && ahora - inicioDHCP >= 15000) {
+        ipFijaAplicada = ETH.config(ethStaticIp, ethGateway, ethSubnet, ethGateway);
+        inicioDHCP = ahora;
+        Serial.printf("[ETH] Configuracion IP fija: %s\n", ipFijaAplicada ? "aplicada" : "fallo");
+      }
+    } else {
+      esperandoIpEthernet = false;
+    }
+    bool ethernetListo = ETH.connected() && ETH.hasIP();
+    bool wifiListo = WiFi.status() == WL_CONNECTED && WiFi.STA.hasIP();
+    uint8_t elegida = 0;
+    if (ethernetListo && (!pausaEthernet || ahora - ultimoFalloEthernet >= 60000 || !wifiListo)) elegida = 1;
+    else if (wifiListo) elegida = 2;
+    IPAddress ipElegida = elegida == 1 ? ETH.localIP()
+      : elegida == 2 ? WiFi.localIP() : IPAddress();
+    if (elegida != redActual || ipElegida != ipActual) {
+      if (wsConectado) wsPuertas.close();
+      wsConectado = false;
+      bool rutaLista = elegida == 0 || (elegida == 1
+        ? Network.setDefaultInterface(ETH) : Network.setDefaultInterface(WiFi.STA));
+      if (!rutaLista) {
+        redActual = 0;
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+      redActual = elegida;
+      ipActual = ipElegida;
+      Serial.printf("[RED] Backend por %s; IP %s\n",
+        redActual == 1 ? "Ethernet" : redActual == 2 ? "Wi-Fi" : "sin red",
+        ipActual.toString().c_str());
+      ultimoIntento = millis() - 5000;
+    }
+    if (redActual != 0 && !wsConectado && millis() - ultimoIntento >= 5000) {
+      ultimoIntento = millis();
+      Serial.println("[BACKEND] Intentando conectar WebSocket de apertura-1...");
+      bool ok = wsPuertas.connect(WS_PUERTAS_URL);
+      if (!ok) Serial.println("[BACKEND] No se pudo conectar; se reintentara.");
+      if (!ok && redActual == 1) {
+        pausaEthernet = true;
+        ultimoFalloEthernet = millis();
+      } else if (ok && redActual == 1) {
+        pausaEthernet = false;
+      }
+      ultimoPing = millis();
+    }
+    if (wsConectado) {
+      wsPuertas.poll();
+      if (wsConectado && millis() - ultimoPing >= 10000) {
+        ultimoPing = millis();
+        wsPuertas.ping();
+      }
+      if (wsConectado && millis() - ultimoPong >= 30000) {
+        Serial.println("[BACKEND] Sin respuesta al ping; reconectando.");
+        wsPuertas.close();
+      }
+      if (!wsConectado && redActual == 1) {
+        pausaEthernet = true;
+        ultimoFalloEthernet = millis();
+      }
+    }
+    atenderHttpLocal();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+void procesarSolicitudCliente(String req, Print& responseStream) {
+  bool ok = true;
+  if (req.indexOf("GET /r1/on") >= 0) ok = encolarOrdenRele(1, true);
+  else if (req.indexOf("GET /r1/off") >= 0) ok = encolarOrdenRele(1, false);
+  if (req.indexOf("GET /r2/on") >= 0) ok = encolarOrdenRele(2, true) && ok;
+  else if (req.indexOf("GET /r2/off") >= 0) ok = encolarOrdenRele(2, false) && ok;
+  if (!ok) {
+    responseStream.println("HTTP/1.1 503 Service Unavailable");
+    responseStream.println("Content-Type: text/plain");
+    responseStream.println("Connection: close");
+    responseStream.println();
+    responseStream.println("No se pudo encolar la orden.");
+    return;
+  }
+
+  // HTML Web de prueba
+  responseStream.println("HTTP/1.1 200 OK");
+  responseStream.println("Content-Type: text/html");
+  responseStream.println("Connection: close");
+  responseStream.println();
+
+  responseStream.println("<!DOCTYPE html><html><head><title>Control de Puertas ESP32</title>");
+  responseStream.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+  responseStream.println("<style>body{font-family:Arial;text-align:center;margin-top:40px;}");
+  responseStream.println(".btn{padding:15px 25px;font-size:18px;margin:10px;color:white;background-color:#008CBA;border:none;border-radius:5px;cursor:pointer;}</style></head><body>");
+
+  responseStream.println("<h2>Receptor de Puertas ESP32 Dual - Gladiator</h2>");
+  responseStream.println("<p><b>Puerta 1 (GPIO 26):</b> <a href=\"/r1/on\"><button class=\"btn\">Abrir Puerta 1</button></a></p>");
+  responseStream.println("<p><b>Puerta 2 (GPIO 27):</b> <a href=\"/r2/on\"><button class=\"btn\">Abrir Puerta 2</button></a></p>");
+
+  responseStream.println("</body></html>");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[INICIO] ESP32 arrancando");
+  digitalWrite(RELE1_PIN, HIGH);
+  digitalWrite(RELE2_PIN, HIGH);
+  pinMode(RELE1_PIN, OUTPUT);
+  pinMode(RELE2_PIN, OUTPUT);
+  colaReles = xQueueCreate(8, sizeof(OrdenRele));
+  if (colaReles == nullptr) {
+    Serial.println("[PUERTAS] Error al crear la cola.");
+    return;
+  }
+  SPI.begin(18, 19, 23, W5500_CS_PIN);
+  ETH.setPollPeriod(10);
+  if (!ETH.begin(ETH_PHY_W5500, 1, W5500_CS_PIN, -1, W5500_RST_PIN, SPI)) {
+    Serial.println("[ETH] No se pudo iniciar W5500; se usara Wi-Fi.");
+  }
+  conectarWiFi();
+  servidorLocal.begin();
+  wsPuertas.onMessage(recibirOrdenBackend);
+  wsPuertas.onEvent(eventoBackend);
+  if (xTaskCreate(tareaRedPuertas, "redPuertas", 8192, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("[PUERTAS] Error al crear la tarea de red.");
+  }
+}
+
+void loop() {
+  OrdenRele orden;
+  for (int i = 0; colaReles != nullptr && i < 8 && xQueueReceive(colaReles, &orden, 0) == pdPASS; i++) {
+    if (millis() - orden.creadaEn > 5000) {
+      Serial.println("[PUERTAS] Orden vencida; descartada.");
+      continue;
+    }
+    if (orden.puerta == 1) {
+      if (orden.abrir) activarPuerta1(); else desactivarPuerta1();
+    } else if (orden.puerta == 2) {
+      if (orden.abrir) activarPuerta2(); else desactivarPuerta2();
+    }
+  }
+  revisarTemporizadoresReles();
+  delay(1);
+}
