@@ -17,13 +17,14 @@ import '../widgets/directorio_modal.dart';
 import '../widgets/reportes_modal.dart';
 import '../widgets/mensajes_modal.dart';
 import '../widgets/puertas_modal.dart';
+import '../widgets/horarios_modal.dart';
 import '../widgets/notificaciones_panel_modal.dart';
 import '../helpers/message_navigation.dart';
 import '../services/esp32_audio_bridge.dart';
 import '../services/notification_history_service.dart';
 import '../services/emergency_service.dart';
 
-enum _OpcionMenuConserje { directorio, mensajes, puertas }
+enum _OpcionMenuConserje { directorio, mensajes, puertas, horarios }
 
 class ConserjeScreen extends StatefulWidget {
   const ConserjeScreen({super.key});
@@ -679,7 +680,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       ),
       builder: (menuContext) => SafeArea(
         top: false,
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.symmetric(vertical: 8),
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -732,6 +733,20 @@ class _ConserjeScreenState extends State<ConserjeScreen>
                   _OpcionMenuConserje.puertas,
                 ),
               ),
+              ListTile(
+                leading: const Icon(
+                  Icons.schedule_rounded,
+                  color: Color(0xFF448AFF),
+                ),
+                title: const Text(
+                  'Horarios',
+                  style: TextStyle(color: Colors.white),
+                ),
+                onTap: () => Navigator.pop(
+                  menuContext,
+                  _OpcionMenuConserje.horarios,
+                ),
+              ),
             ],
           ),
         ),
@@ -748,6 +763,9 @@ class _ConserjeScreenState extends State<ConserjeScreen>
         break;
       case _OpcionMenuConserje.puertas:
         _abrirPuertas();
+        break;
+      case _OpcionMenuConserje.horarios:
+        _abrirHorarios();
         break;
     }
   }
@@ -793,6 +811,16 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       useSafeArea: true,
       backgroundColor: Colors.transparent,
       builder: (_) => PuertasModal(miRut: miRut, soloApertura: true),
+    );
+  }
+
+  void _abrirHorarios() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => HorariosModal(miRut: miRut),
     );
   }
 
@@ -1052,7 +1080,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
               largeSize: 18,
               child: FloatingActionButton(
                 heroTag: 'fab_menu',
-                tooltip: 'Contactos, mensajes y puertas',
+                tooltip: 'Contactos, mensajes, puertas y horarios',
                 backgroundColor: const Color(0xFF448AFF),
                 onPressed: _abrirMenu,
                 child: const Icon(Icons.menu_rounded, color: Colors.white),
