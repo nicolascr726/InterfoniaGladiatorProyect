@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../config.dart';
+import '../services/puertas_excel_service.dart';
+import '../helpers/filtro_fecha_hora.dart';
 
 class PuertasModal extends StatefulWidget {
   static const String abrirPuertaEndpoint = '$kBaseUrl/api/puertas';
@@ -29,9 +31,13 @@ class _PuertasModalState extends State<PuertasModal> {
   bool? _esAdmin;
   bool _cargandoSesion = true;
   bool _consultando = false;
+  bool _exportando = false;
   int? _enviandoPuerta;
   String? _error;
   List<Map<String, dynamic>> _registros = [];
+  Map<String, Map<String, dynamic>> _citofonosPorId = {};
+  final _busqueda = TextEditingController();
+  FiltroFechaHora _filtroFechaHora = const FiltroFechaHora();
 
   bool get _mostrarReporte => _esAdmin == true && !widget.soloApertura;
   bool get _puedeAbrirPuertas =>
@@ -47,6 +53,7 @@ class _PuertasModalState extends State<PuertasModal> {
   @override
   void dispose() {
     _timer?.cancel();
+    _busqueda.dispose();
     if (widget.client == null) _client.close();
     super.dispose();
   }
@@ -106,7 +113,7 @@ class _PuertasModalState extends State<PuertasModal> {
   }
 
   Future<void> _cargarRegistros() async {
-    if (!mounted || !_mostrarReporte || _consultando) return;
+    if (!mounted || !_mostrarReporte || _consultando || _exportando) return;
     setState(() => _consultando = true);
     try {
       final response = await _client
@@ -122,15 +129,91 @@ class _PuertasModalState extends State<PuertasModal> {
       }
       final registros =
           data.map((r) => Map<String, dynamic>.from(r as Map)).toList();
+      final citofonos = await _consultarCitofonos(registros);
       if (!mounted) return;
       setState(() {
         _registros = registros;
+        _citofonosPorId = citofonos;
         _error = null;
       });
     } catch (e) {
       if (mounted) setState(() => _error = _mensajeError(e));
     } finally {
       if (mounted) setState(() => _consultando = false);
+    }
+  }
+
+  String _texto(dynamic valor) => valor?.toString().trim() ?? '';
+
+  bool _esAliasCitofono(String rut) =>
+      _normalizarRut(rut).replaceAll('Ó', 'O').contains('CITOFONO');
+
+  String _deviceIdRegistro(Map<String, dynamic> registro) {
+    final identidad = registro['citofono'];
+    final id = _texto(registro['device_id']);
+    if (id.isNotEmpty) return id;
+    if (identidad is Map) {
+      final idGuardado = _texto(identidad['device_id']);
+      if (idGuardado.isNotEmpty) return idGuardado;
+    }
+    // Los registros antiguos conservan el dispositivo solo en esta descripción.
+    return RegExp(
+          r'^Solicitud recibida desde el cit[oó]fono ([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\.$',
+          caseSensitive: false,
+        ).firstMatch(_texto(registro['descripcion']))?.group(1) ??
+        '';
+  }
+
+  String _rutRegistrado(Map<String, dynamic> registro) {
+    final rut = _texto(registro['rut_emisor']);
+    if (rut.isNotEmpty && !_esAliasCitofono(rut)) return rut;
+    final identidad = registro['citofono'];
+    if (identidad is Map) {
+      final rutGuardado = _texto(identidad['rut_usuario']);
+      if (rutGuardado.isNotEmpty && !_esAliasCitofono(rutGuardado)) {
+        return rutGuardado;
+      }
+    }
+    return '';
+  }
+
+  String _departamentoRegistrado(Map<String, dynamic> registro) {
+    final departamento = _texto(registro['id_dpto']);
+    if (departamento.isNotEmpty) return departamento;
+    final identidad = registro['citofono'];
+    return identidad is Map ? _texto(identidad['id_dpto']) : '';
+  }
+
+  Map<String, dynamic>? _citofonoActual(Map<String, dynamic> registro) {
+    if (_rutRegistrado(registro).isNotEmpty) return null;
+    return _citofonosPorId[_deviceIdRegistro(registro)];
+  }
+
+  Future<Map<String, Map<String, dynamic>>> _consultarCitofonos(
+      List<Map<String, dynamic>> registros) async {
+    if (!registros.any((registro) =>
+        _rutRegistrado(registro).isEmpty &&
+        _deviceIdRegistro(registro).isNotEmpty)) {
+      return {};
+    }
+    try {
+      final response = await _client
+          .get(Uri.parse('$kBaseUrl/api/esp32/audio-status'))
+          .timeout(const Duration(seconds: 8));
+      final data = _leerRespuesta(response);
+      final dispositivos = data is Map ? data['citofonos'] : null;
+      if (dispositivos is! List) return {};
+      return {
+        for (final dispositivo in dispositivos.whereType<Map>())
+          if (_texto(dispositivo['device_id']).isNotEmpty &&
+              _texto(dispositivo['rut_usuario']).isNotEmpty &&
+              !_esAliasCitofono(_texto(dispositivo['rut_usuario'])))
+            _texto(dispositivo['device_id']):
+                Map<String, dynamic>.from(dispositivo),
+      };
+    } catch (_) {
+      // La asociación actual no sustituye la identidad histórica del registro.
+      return {};
     }
   }
 
@@ -194,21 +277,132 @@ class _PuertasModalState extends State<PuertasModal> {
     );
   }
 
+  DateTime? _fechaLocal(dynamic valor) => PuertasExcelService.fechaLocal(valor);
+
+  String _dia(DateTime? fecha) {
+    if (fecha == null) return 'Fecha no registrada';
+    String dos(int numero) => numero.toString().padLeft(2, '0');
+    return '${dos(fecha.day)}/${dos(fecha.month)}/${fecha.year}';
+  }
+
   String _fechaRegistro(dynamic valor) {
-    final texto = valor?.toString().trim() ?? '';
-    final tieneZona =
-        RegExp(r'(Z|[+-]\d{2}:?\d{2})$', caseSensitive: false).hasMatch(texto);
-    final fecha = DateTime.tryParse(tieneZona ? texto : '${texto}Z')?.toLocal();
+    final fecha = _fechaLocal(valor);
     if (fecha == null) return '';
     String dos(int numero) => numero.toString().padLeft(2, '0');
     return '${dos(fecha.day)}/${dos(fecha.month)}/${fecha.year} '
         '${dos(fecha.hour)}:${dos(fecha.minute)}:${dos(fecha.second)}';
   }
 
+  String _normalizarBusqueda(String valor) => valor
+      .toLowerCase()
+      .trim()
+      .replaceFirst(RegExp(r'^(departamento|depto|dpto|rut)[.:]?\s*'), '')
+      .replaceAll(RegExp(r'[\s\-\.#°º]'), '');
+
+  List<Map<String, dynamic>> _registrosVisibles() {
+    final consulta = _normalizarBusqueda(_busqueda.text);
+    return _registros.where((registro) {
+      if (!_filtroFechaHora.incluye(_fechaLocal(registro['fecha_creacion']))) {
+        return false;
+      }
+      final asociado = _citofonoActual(registro);
+      final departamento = _departamentoRegistrado(registro);
+      return [
+        departamento,
+        _rutRegistrado(registro),
+        if (departamento.isEmpty) _texto(asociado?['id_dpto']),
+        _texto(asociado?['rut_usuario']),
+      ].any((valor) => _normalizarBusqueda(valor).contains(consulta));
+    }).toList()
+      ..sort((a, b) {
+        final fechaA = _fechaLocal(a['fecha_creacion']);
+        final fechaB = _fechaLocal(b['fecha_creacion']);
+        if (fechaA == null) return fechaB == null ? 0 : 1;
+        if (fechaB == null) return -1;
+        return fechaB.compareTo(fechaA);
+      });
+  }
+
+  Future<void> _exportarExcel() async {
+    if (!_mostrarReporte ||
+        _cargandoSesion ||
+        _consultando ||
+        _exportando ||
+        _error != null) {
+      return;
+    }
+    final registros = _registrosVisibles().map((registro) {
+      final rut = _rutRegistrado(registro);
+      final departamento = _departamentoRegistrado(registro);
+      final asociado = _citofonoActual(registro);
+      return <String, dynamic>{
+        ...registro,
+        'rut_emisor': rut.isEmpty ? registro['rut_emisor'] : rut,
+        'id_dpto': departamento,
+        'device_id': _deviceIdRegistro(registro),
+        if (asociado != null) ...{
+          'rut_asociado_actual': asociado['rut_usuario'],
+          if (departamento.isEmpty)
+            'id_dpto_asociado_actual': asociado['id_dpto'],
+        },
+      };
+    }).toList();
+    if (registros.isEmpty) return;
+    setState(() => _exportando = true);
+    try {
+      final guardado =
+          await PuertasExcelService.exportar(registros, client: _client);
+      if (guardado && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+              'Excel guardado con ${registros.length} registros de puertas.'),
+        ));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('No se pudo guardar el Excel. Inténtalo nuevamente.'),
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _exportando = false);
+    }
+  }
+
+  List<Widget> _registrosAgrupados(List<Map<String, dynamic>> registros) {
+    final widgets = <Widget>[];
+    String? diaAnterior;
+    for (final registro in registros) {
+      final dia = _dia(_fechaLocal(registro['fecha_creacion']));
+      if (dia != diaAnterior) {
+        widgets.add(Padding(
+          padding: const EdgeInsets.only(top: 4, bottom: 12),
+          child: Row(children: [
+            const Expanded(child: Divider(color: Colors.white24)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(dia,
+                  style: const TextStyle(
+                      color: Colors.white70, fontWeight: FontWeight.w600)),
+            ),
+            const Expanded(child: Divider(color: Colors.white24)),
+          ]),
+        ));
+        diaAnterior = dia;
+      }
+      widgets.add(_registro(registro));
+    }
+    return widgets;
+  }
+
   Widget _registro(Map<String, dynamic> registro) {
     final fecha = _fechaRegistro(registro['fecha_creacion']);
-    final dpto = registro['id_dpto']?.toString() ?? '';
-    final emisor = registro['rut_emisor']?.toString() ?? '';
+    final dpto = _departamentoRegistrado(registro);
+    final emisor = _rutRegistrado(registro);
+    final deviceId = _deviceIdRegistro(registro);
+    final asociado = _citofonoActual(registro);
+    final rutAsociado = _texto(asociado?['rut_usuario']);
+    final dptoAsociado = _texto(asociado?['id_dpto']);
     final titulo = registro['titulo']?.toString() ?? 'Registro de puerta';
     final descripcion = registro['descripcion']?.toString() ?? '';
     return Padding(
@@ -228,7 +422,16 @@ class _PuertasModalState extends State<PuertasModal> {
               Text(
                 [
                   if (dpto.isNotEmpty) 'Depto. $dpto',
-                  if (emisor.isNotEmpty) 'RUT: $emisor',
+                  if (dpto.isEmpty && dptoAsociado.isNotEmpty)
+                    'Depto. asociado actualmente: $dptoAsociado',
+                  if (deviceId.isNotEmpty) 'Citófono: $deviceId',
+                  if (emisor.isNotEmpty)
+                    'RUT: $emisor'
+                  else if (rutAsociado.isNotEmpty)
+                    'RUT: $rutAsociado'
+                  else if (_esAliasCitofono(_texto(registro['rut_emisor'])) ||
+                      deviceId.isNotEmpty)
+                    'RUT del citófono no registrado',
                   if (fecha.isNotEmpty) fecha,
                 ].join('\n'),
                 style: const TextStyle(color: Colors.grey),
@@ -242,6 +445,7 @@ class _PuertasModalState extends State<PuertasModal> {
 
   @override
   Widget build(BuildContext context) {
+    final registros = _registrosVisibles();
     return DraggableScrollableSheet(
       initialChildSize: _mostrarReporte ? 0.75 : 0.55,
       minChildSize: 0.3,
@@ -284,7 +488,8 @@ class _PuertasModalState extends State<PuertasModal> {
                       tooltip: 'Actualizar registros',
                       icon:
                           const Icon(Icons.refresh_rounded, color: Colors.grey),
-                      onPressed: _consultando ? null : _cargarRegistros,
+                      onPressed:
+                          _consultando || _exportando ? null : _cargarRegistros,
                     ),
                   IconButton(
                     tooltip: 'Cerrar puertas',
@@ -313,11 +518,98 @@ class _PuertasModalState extends State<PuertasModal> {
                 _botonPuerta(2),
               ],
               if (_mostrarReporte) ...[
-                if (_registros.isEmpty && !_consultando && _error == null)
-                  const Text('No hay registros de puertas.',
-                      style: TextStyle(color: Colors.grey),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        key: const ValueKey('buscar_puertas'),
+                        controller: _busqueda,
+                        onChanged: (_) => setState(() {}),
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          labelText: 'Buscar por departamento o RUT',
+                          hintText: 'Ej.: 101 o 12.345.678-9',
+                          labelStyle: const TextStyle(color: Colors.white70),
+                          hintStyle: const TextStyle(color: Colors.white54),
+                          prefixIcon:
+                              const Icon(Icons.search, color: Colors.white54),
+                          suffixIcon: _busqueda.text.isEmpty
+                              ? null
+                              : IconButton(
+                                  tooltip: 'Limpiar búsqueda',
+                                  icon: const Icon(Icons.close,
+                                      color: Colors.white54),
+                                  onPressed: () => setState(_busqueda.clear)),
+                          filled: true,
+                          fillColor: const Color(0xFF1E293B),
+                          border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    SizedBox(
+                      width: 108,
+                      child: FiltroFechaHoraButton(
+                        key: const ValueKey('filtro_puertas'),
+                        filtro: _filtroFechaHora,
+                        enabled: !_exportando,
+                        mostrarResumen: false,
+                        onChanged: (filtro) =>
+                            setState(() => _filtroFechaHora = filtro),
+                      ),
+                    ),
+                  ],
+                ),
+                if (_filtroFechaHora.activo)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _filtroFechaHora.resumen,
+                      textAlign: TextAlign.center,
+                      style:
+                          const TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('exportar_puertas'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF20CDFF),
+                      disabledForegroundColor: Colors.white38,
+                    ),
+                    onPressed: _cargandoSesion ||
+                            _consultando ||
+                            _exportando ||
+                            _error != null ||
+                            registros.isEmpty
+                        ? null
+                        : _exportarExcel,
+                    icon: _exportando
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.download_outlined),
+                    label: Text(_exportando
+                        ? 'Guardando Excel…'
+                        : 'Exportar a Excel (${registros.length})'),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                if (registros.isEmpty && !_consultando && _error == null)
+                  Text(
+                      _filtroFechaHora.activo
+                          ? 'No hay registros de puertas que coincidan con los filtros.'
+                          : _normalizarBusqueda(_busqueda.text).isNotEmpty
+                              ? 'No hay registros de puertas para ese departamento o RUT.'
+                              : 'No hay registros de puertas.',
+                      style: const TextStyle(color: Colors.grey),
                       textAlign: TextAlign.center),
-                ..._registros.map(_registro),
+                ..._registrosAgrupados(registros),
               ],
             ],
           ),

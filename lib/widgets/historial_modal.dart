@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import '../config.dart';
 import '../services/historial_excel_service.dart';
+import '../helpers/filtro_fecha_hora.dart';
 
 class HistorialModal extends StatefulWidget {
   final String miRut;
@@ -17,7 +18,10 @@ class _HistorialModalState extends State<HistorialModal> {
   late final http.Client _client;
   List<Map<String, dynamic>> _historial = [];
   Map<String, String> _nombresPorRut = {};
+  Map<String, String> _departamentosPorRut = {};
   Map<String, Map<String, dynamic>> _citofonosPorId = {};
+  final _busqueda = TextEditingController();
+  FiltroFechaHora _filtroFechaHora = const FiltroFechaHora();
   bool _loading = true;
   bool _exportando = false;
 
@@ -30,6 +34,7 @@ class _HistorialModalState extends State<HistorialModal> {
 
   @override
   void dispose() {
+    _busqueda.dispose();
     if (widget.client == null) _client.close();
     super.dispose();
   }
@@ -66,35 +71,56 @@ class _HistorialModalState extends State<HistorialModal> {
       });
       await Future.wait([
         _cargarCitofonos(),
-        if (_requiereNombresParticipantes(historial))
-          _cargarNombresParticipantes(),
+        _cargarParticipantes(),
       ]);
     } catch (_) {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-  bool _requiereNombresParticipantes(List<Map<String, dynamic>> historial) {
-    String texto(dynamic valor) => valor?.toString().trim() ?? '';
-    return historial.any((llamada) {
-      final tipo =
-          texto(llamada['tipo']).replaceAll(RegExp(r'\s+'), ' ').toLowerCase();
-      final saliente = tipo == 'saliente' || tipo.startsWith('saliente ');
-      final faltaEmisor = texto(llamada['nombre_emisor']).isEmpty &&
-          (texto(llamada['rut_emisor']).isNotEmpty ||
-              (saliente && widget.miRut.trim().isNotEmpty));
-      final faltaReceptor = texto(llamada['nombre_receptor']).isEmpty &&
-          texto(llamada['rut_receptor']).isNotEmpty;
-      return faltaEmisor || faltaReceptor;
-    });
-  }
-
-  Future<void> _cargarNombresParticipantes() async {
+  Future<void> _cargarParticipantes() async {
+    if (_historial.isEmpty) return;
     try {
-      final nombres = await HistorialExcelService.consultarNombresParticipantes(
-          _client, widget.miRut);
+      final listas = await Future.wait(
+        ['/usuarios-todos', '/usuarios-conserjes'].map((ruta) async {
+          final respuesta = await _client
+              .get(Uri.parse('$kBaseUrl$ruta')
+                  .replace(queryParameters: {'rut': widget.miRut}))
+              .timeout(const Duration(seconds: 15));
+          if (respuesta.statusCode != 200) {
+            throw const FormatException('No se pudo consultar el directorio.');
+          }
+          final datos = jsonDecode(utf8.decode(respuesta.bodyBytes));
+          if (datos is! List || datos.any((usuario) => usuario is! Map)) {
+            throw const FormatException('El directorio no es válido.');
+          }
+          return datos
+              .map((usuario) => Map<String, dynamic>.from(usuario as Map))
+              .toList();
+        }),
+      );
+      final esConserje = listas[1].any((usuario) =>
+          _normalizarIdentificador(usuario['rut_usuario']) ==
+              _normalizarIdentificador(widget.miRut) &&
+          (usuario['es_admin'] == true || usuario['es_admin'] == 1));
+      if (!esConserje) return;
+      final nombres = <String, String>{};
+      final departamentos = <String, String>{};
+      for (final usuario in listas.expand((usuarios) => usuarios)) {
+        final rut = _normalizarIdentificador(usuario['rut_usuario']);
+        if (rut.isEmpty) continue;
+        final nombre = [usuario['nombres'], usuario['apellido_1']]
+            .map(_texto)
+            .where((parte) => parte.isNotEmpty)
+            .join(' ');
+        nombres[rut] = nombre.isEmpty ? _texto(usuario['rut_usuario']) : nombre;
+        departamentos[rut] = _texto(usuario['id_dpto']);
+      }
       if (!mounted) return;
-      setState(() => _nombresPorRut = nombres);
+      setState(() {
+        _nombresPorRut = nombres;
+        _departamentosPorRut = departamentos;
+      });
     } catch (_) {
       // El historial permanece visible si no se puede consultar el directorio.
       // No se asigna al usuario actual como receptor de llamadas de terceros.
@@ -102,6 +128,44 @@ class _HistorialModalState extends State<HistorialModal> {
   }
 
   String _texto(dynamic valor) => valor?.toString().trim() ?? '';
+
+  String _normalizarBusqueda(String valor) => valor
+      .toLowerCase()
+      .trim()
+      .replaceFirst(RegExp(r'^(departamento|depto|dpto|rut)[.:]?\s*'), '')
+      .replaceAll(RegExp(r'[\s\-\.#°º]'), '');
+
+  List<Map<String, dynamic>> _historialVisible() {
+    final consulta = _normalizarBusqueda(_busqueda.text);
+    return _historial.where((llamada) {
+      if (!_filtroFechaHora.incluye(_fechaLocal(llamada['fecha']))) {
+        return false;
+      }
+      if (consulta.isEmpty) return true;
+      final citofono = llamada['citofono'];
+      final departamentos = [
+        llamada['id_dpto'],
+        llamada['id_dpto_emisor'],
+        llamada['id_dpto_receptor'],
+        _departamentosPorRut[_normalizarIdentificador(llamada['rut_emisor'])],
+        _departamentosPorRut[_normalizarIdentificador(llamada['rut_receptor'])],
+        if (citofono is Map) ...[
+          citofono['id_dpto'],
+          _departamentosPorRut[
+              _normalizarIdentificador(citofono['rut_usuario'])],
+        ],
+      ];
+      final ruts = [
+        llamada['rut_emisor'],
+        llamada['rut_receptor'],
+        if (citofono is Map) citofono['rut_usuario'],
+      ];
+      return [
+        ...departamentos,
+        ...ruts
+      ].any((valor) => _normalizarBusqueda(_texto(valor)).contains(consulta));
+    }).toList();
+  }
 
   String _normalizarIdentificador(dynamic valor) => _texto(valor)
       .replaceAll(RegExp(r'[.\s-]'), '')
@@ -148,9 +212,7 @@ class _HistorialModalState extends State<HistorialModal> {
       return 'Citofono de ${propietario ?? 'RUT $rut'}';
     }
     final id = _texto(dispositivo['device_id']);
-    return id.isEmpty
-        ? 'Citofono (propietario no registrado)'
-        : 'Citofono $id';
+    return id.isEmpty ? 'Citofono (propietario no registrado)' : 'Citofono $id';
   }
 
   ({String emisor, String receptor}) _resolverParticipantes(
@@ -165,8 +227,8 @@ class _HistorialModalState extends State<HistorialModal> {
     final receptorCitofono = _esCitofono(llamada['rut_receptor']) ||
         _esNombreCitofono(participantes.receptor);
 
-    String resolver(String campoRut, String campoNombre, String nombre,
-        bool esCitofono) {
+    String resolver(
+        String campoRut, String campoNombre, String nombre, bool esCitofono) {
       final rut = _texto(llamada[campoRut]);
       // Preferir la identidad conservada en el registro, si está disponible.
       final identidad = llamada['citofono'];
@@ -202,8 +264,7 @@ class _HistorialModalState extends State<HistorialModal> {
         if (dispositivo != null) return _nombreCitofono(dispositivo);
       }
       if (!esCitofono) return nombre;
-      if (_esCitofono(rut) &&
-          _normalizarIdentificador(rut) != 'CITOFONO') {
+      if (_esCitofono(rut) && _normalizarIdentificador(rut) != 'CITOFONO') {
         return 'Citofono $rut';
       }
       // CITOFONO no identifica una placa concreta, aunque solo haya una online.
@@ -211,16 +272,17 @@ class _HistorialModalState extends State<HistorialModal> {
     }
 
     return (
-      emisor: resolver('rut_emisor', 'nombre_emisor', participantes.emisor,
-          emisorCitofono),
+      emisor: resolver(
+          'rut_emisor', 'nombre_emisor', participantes.emisor, emisorCitofono),
       receptor: resolver('rut_receptor', 'nombre_receptor',
           participantes.receptor, receptorCitofono),
     );
   }
 
   Future<void> _exportarExcel() async {
-    if (_loading || _exportando || _historial.isEmpty) return;
-    final historial = List<Map<String, dynamic>>.from(_historial);
+    if (_loading || _exportando) return;
+    final historial = List<Map<String, dynamic>>.from(_historialVisible());
+    if (historial.isEmpty) return;
     setState(() => _exportando = true);
     try {
       final guardado = await HistorialExcelService.exportar(historial);
@@ -253,7 +315,8 @@ class _HistorialModalState extends State<HistorialModal> {
     }
   }
 
-  DateTime? _fechaLocal(dynamic valor) => HistorialExcelService.fechaLocal(valor);
+  DateTime? _fechaLocal(dynamic valor) =>
+      HistorialExcelService.fechaLocal(valor);
 
   String _dia(dynamic valor) {
     final fecha = _fechaLocal(valor);
@@ -264,6 +327,7 @@ class _HistorialModalState extends State<HistorialModal> {
 
   @override
   Widget build(BuildContext context) {
+    final historial = _historialVisible();
     return DraggableScrollableSheet(
       initialChildSize: 0.92,
       maxChildSize: 0.95,
@@ -303,6 +367,61 @@ class _HistorialModalState extends State<HistorialModal> {
               ),
             ),
             Padding(
+              padding: const EdgeInsets.fromLTRB(18, 16, 18, 0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      key: const ValueKey('buscar_historial'),
+                      controller: _busqueda,
+                      onChanged: (_) => setState(() {}),
+                      style: const TextStyle(color: Colors.white),
+                      decoration: InputDecoration(
+                        labelText: 'Buscar por departamento o RUT',
+                        hintText: 'Ej.: 101 o 12.345.678-9',
+                        labelStyle: const TextStyle(color: Colors.white70),
+                        hintStyle: const TextStyle(color: Colors.white54),
+                        prefixIcon:
+                            const Icon(Icons.search, color: Colors.white54),
+                        suffixIcon: _busqueda.text.isEmpty
+                            ? null
+                            : IconButton(
+                                tooltip: 'Limpiar búsqueda',
+                                icon: const Icon(Icons.close,
+                                    color: Colors.white54),
+                                onPressed: () => setState(_busqueda.clear)),
+                        filled: true,
+                        fillColor: const Color(0xFF1E293B),
+                        border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12)),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 108,
+                    child: FiltroFechaHoraButton(
+                      key: const ValueKey('filtro_historial'),
+                      filtro: _filtroFechaHora,
+                      enabled: !_exportando,
+                      mostrarResumen: false,
+                      onChanged: (filtro) =>
+                          setState(() => _filtroFechaHora = filtro),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_filtroFechaHora.activo)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 6, 18, 0),
+                child: Text(
+                  _filtroFechaHora.resumen,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ),
+            Padding(
               padding: const EdgeInsets.fromLTRB(18, 12, 18, 16),
               child: SizedBox(
                 width: double.infinity,
@@ -312,7 +431,7 @@ class _HistorialModalState extends State<HistorialModal> {
                     foregroundColor: const Color(0xFF20CDFF),
                     disabledForegroundColor: Colors.white38,
                   ),
-                  onPressed: _loading || _exportando || _historial.isEmpty
+                  onPressed: _loading || _exportando || historial.isEmpty
                       ? null
                       : _exportarExcel,
                   icon: _exportando
@@ -324,7 +443,7 @@ class _HistorialModalState extends State<HistorialModal> {
                       : const Icon(Icons.download_outlined),
                   label: Text(_exportando
                       ? 'Guardando Excel…'
-                      : 'Exportar a Excel (${_historial.length})'),
+                      : 'Exportar a Excel (${historial.length})'),
                 ),
               ),
             ),
@@ -333,20 +452,25 @@ class _HistorialModalState extends State<HistorialModal> {
                   ? const Center(
                       child:
                           CircularProgressIndicator(color: Color(0xFF448AFF)))
-                  : _historial.isEmpty
-                      ? const Center(
-                          child: Text('No hay historial de llamadas.',
-                              style: TextStyle(color: Colors.grey)))
+                  : historial.isEmpty
+                      ? Center(
+                          child: Text(
+                              _filtroFechaHora.activo
+                                  ? 'No hay llamadas que coincidan con los filtros.'
+                                  : _normalizarBusqueda(_busqueda.text).isEmpty
+                                      ? 'No hay historial de llamadas.'
+                                      : 'No hay llamadas para ese departamento o RUT.',
+                              style: const TextStyle(color: Colors.grey)))
                       : ListView.builder(
                           controller: scrollCtrl,
                           padding: const EdgeInsets.symmetric(
                               horizontal: 16, vertical: 16),
-                          itemCount: _historial.length,
+                          itemCount: historial.length,
                           itemBuilder: (_, i) {
-                            final l = _historial[i];
+                            final l = historial[i];
                             final dia = _dia(l['fecha']);
                             final mostrarDia = i == 0 ||
-                                _dia(_historial[i - 1]['fecha']) != dia;
+                                _dia(historial[i - 1]['fecha']) != dia;
                             final participantes = _resolverParticipantes(l);
                             final tipo = (l['tipo'] ?? 'Llamada').toString();
                             final fecha =
@@ -445,7 +569,8 @@ class _HistorialModalState extends State<HistorialModal> {
                                         top: 4, bottom: 12),
                                     child: Row(children: [
                                       const Expanded(
-                                          child: Divider(color: Colors.white24)),
+                                          child:
+                                              Divider(color: Colors.white24)),
                                       Padding(
                                         padding: const EdgeInsets.symmetric(
                                             horizontal: 12),
@@ -455,7 +580,8 @@ class _HistorialModalState extends State<HistorialModal> {
                                                 fontWeight: FontWeight.w600)),
                                       ),
                                       const Expanded(
-                                          child: Divider(color: Colors.white24)),
+                                          child:
+                                              Divider(color: Colors.white24)),
                                     ]),
                                   ),
                                 tarjeta,

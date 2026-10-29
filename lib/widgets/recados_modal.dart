@@ -8,6 +8,7 @@ import '../config.dart';
 import '../screens/citofono_audio_screen.dart';
 import '../screens/llamada_screen.dart';
 import '../services/recados_excel_service.dart';
+import '../helpers/filtro_fecha_hora.dart';
 
 class RecadosModal extends StatefulWidget {
   final String miRut;
@@ -38,6 +39,8 @@ class _RecadosModalState extends State<RecadosModal> {
   _IntentoRecado? _intentoLlamada;
   final _busquedaPendientes = TextEditingController();
   final _busquedaResueltos = TextEditingController();
+  FiltroFechaHora _filtroPendientes = const FiltroFechaHora();
+  FiltroFechaHora _filtroResueltos = const FiltroFechaHora();
 
   String get _nombrePlural =>
       widget.mostrarComoMensajes ? 'mensajes' : 'recados';
@@ -371,16 +374,17 @@ class _RecadosModalState extends State<RecadosModal> {
     return '${dos(fecha.day)}/${dos(fecha.month)}/${fecha.year} ${dos(fecha.hour)}:${dos(fecha.minute)}';
   }
 
-  String _normalizarDepartamento(String valor) => valor
+  String _normalizarBusqueda(String valor) => valor
       .toLowerCase()
       .trim()
-      .replaceFirst(RegExp(r'^(departamento|depto|dpto)\.?\s*'), '')
+      .replaceFirst(RegExp(r'^(departamento|depto|dpto|rut)[.:]?\s*'), '')
       .replaceAll(RegExp(r'[\s\-\.#°º]'), '');
 
   List<Map<String, dynamic>> _recadosVisibles({required bool resueltos}) {
     final estado = resueltos ? 'resuelto' : 'pendiente';
+    final filtro = resueltos ? _filtroResueltos : _filtroPendientes;
     final consulta = _esAdmin == true
-        ? _normalizarDepartamento(
+        ? _normalizarBusqueda(
             (resueltos ? _busquedaResueltos : _busquedaPendientes).text)
         : '';
     DateTime? fechaGrupo(Map<String, dynamic> r) =>
@@ -389,8 +393,11 @@ class _RecadosModalState extends State<RecadosModal> {
     return _recados
         .where((r) =>
             r['estado'] == estado &&
-            _normalizarDepartamento(r['id_dpto']?.toString() ?? '')
-                .contains(consulta))
+            filtro.incluye(fechaGrupo(r)) &&
+            (_normalizarBusqueda(r['id_dpto']?.toString() ?? '')
+                    .contains(consulta) ||
+                _normalizarBusqueda(r['rut_emisor']?.toString() ?? '')
+                    .contains(consulta)))
         .toList()
       ..sort((a, b) {
         final fechaA = fechaGrupo(a);
@@ -439,33 +446,83 @@ class _RecadosModalState extends State<RecadosModal> {
   Widget _buildRecados({required bool resueltos}) {
     final controller = resueltos ? _busquedaResueltos : _busquedaPendientes;
     final cantidad = _recadosVisibles(resueltos: resueltos).length;
+    final filtroActual = resueltos ? _filtroResueltos : _filtroPendientes;
+    Widget botonFiltro({bool mostrarResumen = true}) => FiltroFechaHoraButton(
+          key: ValueKey('filtro_${resueltos ? 'resueltos' : 'pendientes'}'),
+          filtro: filtroActual,
+          enabled: !_ocupado,
+          mostrarResumen: mostrarResumen,
+          onChanged: (filtro) {
+            if (!mounted) return;
+            setState(() {
+              if (resueltos) {
+                _filtroResueltos = filtro;
+              } else {
+                _filtroPendientes = filtro;
+              }
+            });
+          },
+        );
     return Column(children: [
       if (_esAdmin == true)
         Padding(
           padding: const EdgeInsets.only(top: 16),
-          child: TextField(
-            key: ValueKey('buscar_${resueltos ? 'resueltos' : 'pendientes'}'),
-            controller: controller,
-            onChanged: (_) => setState(() {}),
-            style: const TextStyle(color: Colors.white),
-            decoration: InputDecoration(
-              labelText: 'Buscar por departamento',
-              hintText: 'Ej.: 101 o Depto. 101',
-              labelStyle: const TextStyle(color: Colors.white70),
-              hintStyle: const TextStyle(color: Colors.white54),
-              prefixIcon: const Icon(Icons.search, color: Colors.white54),
-              suffixIcon: controller.text.isEmpty
-                  ? null
-                  : IconButton(
-                      tooltip: 'Limpiar búsqueda',
-                      icon: const Icon(Icons.close, color: Colors.white54),
-                      onPressed: () => setState(controller.clear)),
-              filled: true,
-              fillColor: const Color(0xFF1E293B),
-              border:
-                  OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      key: ValueKey(
+                          'buscar_${resueltos ? 'resueltos' : 'pendientes'}'),
+                      controller: controller,
+                      onChanged: (_) => setState(() {}),
+                      style: const TextStyle(color: Colors.white),
+                      decoration: InputDecoration(
+                        labelText: 'Buscar por departamento o RUT',
+                        hintText: 'Ej.: 101 o 12.345.678-9',
+                        labelStyle: const TextStyle(color: Colors.white70),
+                        hintStyle: const TextStyle(color: Colors.white54),
+                        prefixIcon:
+                            const Icon(Icons.search, color: Colors.white54),
+                        suffixIcon: controller.text.isEmpty
+                            ? null
+                            : IconButton(
+                                tooltip: 'Limpiar búsqueda',
+                                icon: const Icon(Icons.close,
+                                    color: Colors.white54),
+                                onPressed: () => setState(controller.clear)),
+                        filled: true,
+                        fillColor: const Color(0xFF1E293B),
+                        border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12)),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 108,
+                    child: botonFiltro(mostrarResumen: false),
+                  ),
+                ],
+              ),
+              if (filtroActual.activo)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    filtroActual.resumen,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                ),
+            ],
           ),
+        )
+      else
+        Padding(
+          padding: const EdgeInsets.only(top: 12),
+          child: botonFiltro(),
         ),
       if (_esAdmin == true)
         Padding(
@@ -505,8 +562,9 @@ class _RecadosModalState extends State<RecadosModal> {
 
   Widget _buildListaRecados({required bool resueltos}) {
     final estado = resueltos ? 'resuelto' : 'pendiente';
+    final filtro = resueltos ? _filtroResueltos : _filtroPendientes;
     final consulta = _esAdmin == true
-        ? _normalizarDepartamento(
+        ? _normalizarBusqueda(
             (resueltos ? _busquedaResueltos : _busquedaPendientes).text)
         : '';
     DateTime? fechaGrupo(Map<String, dynamic> r) =>
@@ -519,9 +577,11 @@ class _RecadosModalState extends State<RecadosModal> {
           child: Text(
               _error != null
                   ? 'No se pudieron consultar los $_nombrePlural.'
-                  : consulta.isNotEmpty
-                      ? 'No hay $_nombrePlural ${resueltos ? 'resueltos' : 'pendientes'} para ese departamento.'
-                      : 'No hay $_nombrePlural ${resueltos ? 'resueltos' : 'pendientes'}.',
+                  : filtro.activo
+                      ? 'No hay $_nombrePlural ${resueltos ? 'resueltos' : 'pendientes'} que coincidan con los filtros.'
+                      : consulta.isNotEmpty
+                          ? 'No hay $_nombrePlural ${resueltos ? 'resueltos' : 'pendientes'} para ese departamento o RUT.'
+                          : 'No hay $_nombrePlural ${resueltos ? 'resueltos' : 'pendientes'}.',
               style: const TextStyle(color: Colors.white54)));
     }
     return ListView.separated(
