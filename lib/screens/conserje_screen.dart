@@ -227,7 +227,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       setState(() {
         _versionApp = version.isEmpty
             ? 'Versión no disponible'
-            : 'v $version${compilacion.isEmpty ? '' : '+$compilacion'}';
+            : 'v$version${compilacion.isEmpty ? '' : '+$compilacion'}';
       });
     } catch (e) {
       debugPrint('No se pudo consultar la versión de la aplicación: $e');

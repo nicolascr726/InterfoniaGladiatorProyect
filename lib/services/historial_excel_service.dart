@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config.dart';
+import 'excel_service.dart';
 
 class HistorialExcelService {
   static const _nombreHoja = 'Historial de llamadas';
@@ -357,7 +358,7 @@ class HistorialExcelService {
 
   /// Devuelve false si el usuario cancela el selector de guardado.
   static Future<bool> exportar(List<Map<String, dynamic>> historial,
-      {http.Client? client}) async {
+      {http.Client? client, String? correo}) async {
     if (historial.isEmpty) {
       throw ArgumentError('No hay llamadas para exportar.');
     }
@@ -385,9 +386,15 @@ class HistorialExcelService {
     }
     final bytes = generar(historial, usuarios: usuarios);
     final fecha = DateTime.now().toIso8601String().replaceAll(':', '-');
+    final nombre = 'historial_llamadas_$fecha.xlsx';
+    if (correo != null) {
+      await ExcelService.enviarCorreo(bytes,
+          nombre: nombre, correo: correo, client: client);
+      return true;
+    }
     final destino = await FilePicker.platform.saveFile(
       dialogTitle: 'Guardar historial de llamadas en Excel',
-      fileName: 'historial_llamadas_$fecha.xlsx',
+      fileName: nombre,
       type: FileType.custom,
       allowedExtensions: ['xlsx'],
       bytes: bytes,

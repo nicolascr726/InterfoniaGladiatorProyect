@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../config.dart';
 import '../services/puertas_excel_service.dart';
+import '../services/excel_service.dart';
 import '../helpers/filtro_fecha_hora.dart';
 
 class PuertasModal extends StatefulWidget {
@@ -350,18 +351,22 @@ class _PuertasModalState extends State<PuertasModal> {
     if (registros.isEmpty) return;
     setState(() => _exportando = true);
     try {
-      final guardado =
-          await PuertasExcelService.exportar(registros, client: _client);
-      if (guardado && mounted) {
+      final destino = await ExcelService.mostrarOpciones(
+        context,
+        exportar: (correo) => PuertasExcelService.exportar(registros,
+            client: _client, correo: correo),
+      );
+      if (destino != null && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(
-              'Excel guardado con ${registros.length} registros de puertas.'),
+          content: Text(destino == DestinoExcel.correo
+              ? 'Excel enviado al correo electrónico indicado.'
+              : 'Excel guardado con ${registros.length} registros de puertas.'),
         ));
       }
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('No se pudo guardar el Excel. Inténtalo nuevamente.'),
+          content: Text('No se pudo exportar el Excel. Inténtalo nuevamente.'),
         ));
       }
     } finally {
@@ -595,7 +600,7 @@ class _PuertasModalState extends State<PuertasModal> {
                           )
                         : const Icon(Icons.download_outlined),
                     label: Text(_exportando
-                        ? 'Guardando Excel…'
+                        ? 'Exportando Excel…'
                         : 'Exportar a Excel (${registros.length})'),
                   ),
                 ),

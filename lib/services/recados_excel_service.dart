@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config.dart';
+import 'excel_service.dart';
 
 class RecadosExcelService {
   static String _normalizarRut(dynamic valor) => (valor?.toString() ?? '')
@@ -159,6 +160,7 @@ class RecadosExcelService {
   /// Devuelve false si el usuario cancela el selector de guardado.
   static Future<bool> exportar(List<Map<String, dynamic>> recados,
       {required bool resueltos,
+      String? correo,
       http.Client? client,
       bool mostrarComoMensajes = false}) async {
     final nombreListado = mostrarComoMensajes ? 'mensajes' : 'recados';
@@ -177,6 +179,11 @@ class RecadosExcelService {
     final fecha = DateTime.now().toIso8601String().replaceAll(':', '-');
     final nombre =
         '${nombreListado}_${resueltos ? 'resueltos' : 'pendientes'}_$fecha.xlsx';
+    if (correo != null) {
+      await ExcelService.enviarCorreo(bytes,
+          nombre: nombre, correo: correo, client: client);
+      return true;
+    }
     final destino = await FilePicker.platform.saveFile(
       dialogTitle: 'Guardar $nombreListado en Excel',
       fileName: nombre,

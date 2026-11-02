@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config.dart';
+import '../services/excel_service.dart';
 import '../services/push_notification_service.dart';
 import 'conserje_screen.dart';
 import 'residente_screen.dart';
@@ -51,6 +52,7 @@ class _LoginScreenState extends State<LoginScreen> {
         await prefs.setString('nombre', nombre);
         await prefs.setString('dpto', dpto);
         await prefs.setInt('es_admin', esAdmin);
+        await ExcelService.guardarAutorizacionCorreo(data);
 
         // Llamamos al nuevo servicio de notificaciones
         // Esto pedirá permisos en iOS/Android y enviará el token al backend

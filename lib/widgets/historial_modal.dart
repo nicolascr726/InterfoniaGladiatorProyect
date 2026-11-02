@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import '../config.dart';
 import '../services/historial_excel_service.dart';
+import '../services/excel_service.dart';
 import '../helpers/filtro_fecha_hora.dart';
 
 class HistorialModal extends StatefulWidget {
@@ -285,16 +286,22 @@ class _HistorialModalState extends State<HistorialModal> {
     if (historial.isEmpty) return;
     setState(() => _exportando = true);
     try {
-      final guardado = await HistorialExcelService.exportar(historial);
-      if (guardado && mounted) {
+      final destino = await ExcelService.mostrarOpciones(
+        context,
+        exportar: (correo) => HistorialExcelService.exportar(historial,
+            client: _client, correo: correo),
+      );
+      if (destino != null && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Excel guardado con ${historial.length} llamadas.'),
+          content: Text(destino == DestinoExcel.correo
+              ? 'Excel enviado al correo electrónico indicado.'
+              : 'Excel guardado con ${historial.length} llamadas.'),
         ));
       }
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('No se pudo guardar el Excel. Inténtalo nuevamente.'),
+          content: Text('No se pudo exportar el Excel. Inténtalo nuevamente.'),
         ));
       }
     } finally {
@@ -442,7 +449,7 @@ class _HistorialModalState extends State<HistorialModal> {
                         )
                       : const Icon(Icons.download_outlined),
                   label: Text(_exportando
-                      ? 'Guardando Excel…'
+                      ? 'Exportando Excel…'
                       : 'Exportar a Excel (${historial.length})'),
                 ),
               ),

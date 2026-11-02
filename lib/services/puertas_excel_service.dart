@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config.dart';
+import 'excel_service.dart';
 
 class PuertasExcelService {
   static String _texto(dynamic valor) => valor?.toString().trim() ?? '';
@@ -191,7 +192,7 @@ class PuertasExcelService {
 
   /// Devuelve false si el usuario cancela el selector de guardado.
   static Future<bool> exportar(List<Map<String, dynamic>> registros,
-      {http.Client? client}) async {
+      {http.Client? client, String? correo}) async {
     if (registros.isEmpty) {
       throw ArgumentError('No hay registros de puertas para exportar.');
     }
@@ -206,9 +207,15 @@ class PuertasExcelService {
     }
     final bytes = generar(registros, usuarios: usuarios);
     final fecha = DateTime.now().toIso8601String().replaceAll(':', '-');
+    final nombre = 'registros_puertas_$fecha.xlsx';
+    if (correo != null) {
+      await ExcelService.enviarCorreo(bytes,
+          nombre: nombre, correo: correo, client: client);
+      return true;
+    }
     final destino = await FilePicker.platform.saveFile(
       dialogTitle: 'Guardar registros de puertas en Excel',
-      fileName: 'registros_puertas_$fecha.xlsx',
+      fileName: nombre,
       type: FileType.custom,
       allowedExtensions: ['xlsx'],
       bytes: bytes,

@@ -8,6 +8,7 @@ import '../config.dart';
 import '../screens/citofono_audio_screen.dart';
 import '../screens/llamada_screen.dart';
 import '../services/recados_excel_service.dart';
+import '../services/excel_service.dart';
 import '../helpers/filtro_fecha_hora.dart';
 
 class RecadosModal extends StatefulWidget {
@@ -417,20 +418,27 @@ class _RecadosModalState extends State<RecadosModal> {
       _exportando = true;
     });
     try {
-      final guardado = await RecadosExcelService.exportar(
-        recados,
-        resueltos: resueltos,
-        mostrarComoMensajes: widget.mostrarComoMensajes,
+      final destino = await ExcelService.mostrarOpciones(
+        context,
+        exportar: (correo) => RecadosExcelService.exportar(
+          recados,
+          resueltos: resueltos,
+          mostrarComoMensajes: widget.mostrarComoMensajes,
+          client: _client,
+          correo: correo,
+        ),
       );
-      if (guardado && mounted) {
+      if (destino != null && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Excel guardado con ${recados.length} $_nombrePlural.'),
+          content: Text(destino == DestinoExcel.correo
+              ? 'Excel enviado al correo electrónico indicado.'
+              : 'Excel guardado con ${recados.length} $_nombrePlural.'),
         ));
       }
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('No se pudo guardar el Excel. Inténtalo nuevamente.'),
+          content: Text('No se pudo exportar el Excel. Inténtalo nuevamente.'),
         ));
       }
     } finally {
@@ -551,7 +559,7 @@ class _RecadosModalState extends State<RecadosModal> {
                       child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.download_outlined),
               label: Text(_exportando
-                  ? 'Guardando Excel…'
+                  ? 'Exportando Excel…'
                   : 'Exportar a Excel ($cantidad)'),
             ),
           ),

@@ -45,3 +45,7 @@ app.*.map.json
 /android/app/release
 *.apk
 .aider*
+
+# Configuración privada de correo (incluye contraseña de aplicación).
+/correo_config.json
+/correo_config.json.*
