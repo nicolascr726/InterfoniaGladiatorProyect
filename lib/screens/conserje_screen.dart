@@ -12,6 +12,7 @@ import 'llamada_screen.dart';
 import 'citofono_audio_screen.dart';
 import '../helpers/citofono_call_utils.dart';
 import '../helpers/call_notifications.dart';
+import '../helpers/incoming_call_dialog.dart';
 import 'login_screen.dart';
 import '../widgets/directorio_modal.dart';
 import '../widgets/reportes_modal.dart';
@@ -47,7 +48,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
   bool _enviandoAvisoEmergencia = false;
   String? _versionApp;
   final _ringtonePlayer = FlutterRingtonePlayer();
-  bool _dialogoEntranteAbierto = false;
+  IncomingCallDialog? _llamadaEntrante;
   List<NotificationHistoryEntry> _notificaciones = [];
   bool _loadingNotificaciones = true;
   String? _errorNotificaciones;
@@ -392,29 +393,13 @@ class _ConserjeScreenState extends State<ConserjeScreen>
         
         // Guardar persistencia de manera asíncrona
         _guardarContadoresEnDisco();
-
-        final sender = (data['sender_label'] ?? emisor).toString();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Nuevo mensaje de $sender'),
-            backgroundColor: const Color(0xFF448AFF),
-            action: SnackBarAction(
-              label: 'Abrir',
-              textColor: Colors.white,
-              onPressed: _abrirMensajes,
-            ),
-          ),
-        );
       }
     });
 
     socket.on('missed-call', (data) {
       if (!mounted) return;
       _registrarNotificacion('missed_call', data);
-      _detenerTono();
-      if (_dialogoEntranteAbierto) {
-        Navigator.of(context, rootNavigator: true).pop();
-      }
+      if (!_cerrarDialogoEntrante(data)) return;
       final caller = data is Map
           ? (data['caller_dpto'] ?? data['caller_rut'] ?? 'Citófono').toString()
           : 'Citófono';
@@ -432,129 +417,90 @@ class _ConserjeScreenState extends State<ConserjeScreen>
 
     socket.on('end-call', (data) {
       if (!mounted) return;
-      _detenerTono();
-      if (_dialogoEntranteAbierto) {
-        Navigator.of(context, rootNavigator: true).pop();
-      }
+      if (!_cerrarDialogoEntrante(data)) return;
     });
     socket.connect();
   }
 
-  void _mostrarLlamadaEntrante(dynamic data) {
-    if (!mounted) return;
-
-    final Map<dynamic, dynamic> payload = data is Map ? data : <dynamic, dynamic>{};
-    final bool esCitofono = isCitofonoAudioCall(payload);
-    Timer? handsetTimer;
-    bool handled = false;
-
-    void cancelHandsetTimer() {
-      handsetTimer?.cancel();
-      handsetTimer = null;
-    }
-
-    void aceptarEntrante({required bool desdeBanana}) {
-      if (handled || !mounted) return;
-      handled = true;
-      cancelHandsetTimer();
+  bool _cerrarDialogoEntrante(dynamic data) {
+    final dialog = _llamadaEntrante;
+    if (dialog != null && !dialog.matches(data)) return false;
+    if (dialog != null) {
+      dialog.close();
+    } else {
       _detenerTono();
-      Navigator.of(context, rootNavigator: true).pop();
-
-      Navigator.push(context, MaterialPageRoute(
-        builder: (_) => esCitofono
-            ? CitofonoAudioScreen(
-                room: payload['caller_rut']?.toString() ?? '',
-                isCaller: false,
-                socket: socket,
-                miRut: miRut,
-                rutDestino: payload['caller_rut']?.toString() ?? '',
-                callId: payload['call_id']?.toString(),
-                initialSpeakerOn: !desdeBanana,
-              )
-            : LlamadaScreen(
-                room: payload['caller_rut']?.toString() ?? '',
-                isCaller: false,
-                tipo: payload['tipo']?.toString() ?? 'video',
-                socket: socket,
-                miRut: miRut,
-                rutDestino: payload['caller_rut']?.toString() ?? '',
-              ),
-      ));
     }
-
-    Future<void> revisarBanana() async {
-      if (handled || !mounted) return;
-      final state = await Esp32AudioBridge.getHandsetState();
-      if (handled || !mounted) return;
-      if (state['handsetLifted'] == true) {
-        aceptarEntrante(desdeBanana: true);
-      }
-    }
-
-    _tocarTono();
-
-    if (esCitofono) {
-      Esp32AudioBridge.resetHandsetState().then((_) {
-        if (handled || !mounted) return;
-        handsetTimer = Timer.periodic(
-          const Duration(milliseconds: 250),
-          (_) => revisarBanana(),
-        );
-        revisarBanana();
-      });
-    }
-
-    _dialogoEntranteAbierto = true;
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF222233),
-        title: const Text('📞 Llamada entrante', style: TextStyle(color: Colors.white)),
-        content: Text(
-          'De: ${payload['caller_dpto'] ?? payload['caller_rut']}',
-          style: const TextStyle(color: Colors.grey),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              handled = true;
-              cancelHandsetTimer();
-              _rechazarEntrante(payload);
-            },
-            child: const Text('Rechazar', style: TextStyle(color: Colors.red)),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF448AFF)),
-            onPressed: () => aceptarEntrante(desdeBanana: false),
-            child: const Text('Aceptar'),
-          ),
-        ],
-      ),
-    ).then((_) {
-      cancelHandsetTimer();
-      _dialogoEntranteAbierto = false;
-    });
+    return true;
   }
 
-  Future<void> _rechazarEntrante(dynamic data) async {
-    _detenerTono();
-    if (mounted) Navigator.pop(context);
+  Future<void> _mostrarLlamadaEntrante(dynamic data) async {
+    if (!mounted || _cerrandoSesion || _llamadaEntrante != null) return;
 
+    final payload = data is Map ? Map<dynamic, dynamic>.from(data) : <dynamic, dynamic>{};
+    final esCitofono = isCitofonoAudioCall(payload);
+    final dialog = IncomingCallDialog(
+      payload: payload,
+      isCitofono: esCitofono,
+      onStopRinging: _detenerTono,
+      resetHandset: esCitofono ? Esp32AudioBridge.resetHandsetState : null,
+      isHandsetLifted: esCitofono
+          ? () async => (await Esp32AudioBridge.getHandsetState())['handsetLifted'] == true
+          : null,
+    );
+    _llamadaEntrante = dialog;
+    _tocarTono();
+    final decision = await dialog.show(context);
+    if (identical(_llamadaEntrante, dialog)) _llamadaEntrante = null;
+    if (!mounted || _cerrandoSesion) return;
+
+    if (decision == IncomingCallDecision.reject || decision == IncomingCallDecision.timeout) {
+      await _finalizarEntrante(payload, sinRespuesta: decision == IncomingCallDecision.timeout);
+      return;
+    }
+    if (decision != IncomingCallDecision.accept && decision != IncomingCallDecision.acceptWithHandset) return;
+
+    Navigator.push(context, MaterialPageRoute(
+      builder: (_) => esCitofono
+          ? CitofonoAudioScreen(
+              room: payload['caller_rut']?.toString() ?? '',
+              isCaller: false,
+              socket: socket,
+              miRut: miRut,
+              rutDestino: payload['caller_rut']?.toString() ?? '',
+              callId: payload['call_id']?.toString(),
+              initialSpeakerOn: decision != IncomingCallDecision.acceptWithHandset,
+            )
+          : LlamadaScreen(
+              room: payload['caller_rut']?.toString() ?? '',
+              isCaller: false,
+              tipo: payload['tipo']?.toString() ?? 'video',
+              socket: socket,
+              miRut: miRut,
+              rutDestino: payload['caller_rut']?.toString() ?? '',
+            ),
+    ));
+  }
+
+  Future<void> _finalizarEntrante(dynamic data, {required bool sinRespuesta}) async {
     final Map<dynamic, dynamic> payload = data is Map ? data : <dynamic, dynamic>{};
     final bool esCitofono = isCitofonoAudioCall(payload);
 
     if (!esCitofono) {
-      socket.emit('busy', {'room': payload['caller_rut']});
+      socket.emit(sinRespuesta ? 'end-call' : 'busy', {'room': payload['caller_rut']});
+      if (sinRespuesta) socket.emit('free-rut', {'rut': miRut});
       return;
     }
 
     final callId = payload['call_id']?.toString();
+    if (sinRespuesta && (callId == null || callId.isEmpty)) return;
+    final reason = sinRespuesta ? 'timeout' : 'rechazada';
+    final estado = sinRespuesta ? 'perdida' : 'rechazada';
     try {
       socket.emit('citofono-end-call', {
         'call_id': callId,
-        'reason': 'rechazada',
-        'estado': 'rechazada',
+        'reason': reason,
+        'estado': estado,
+        'only_if_ringing': sinRespuesta,
       });
       await http.post(
         Uri.parse('$kBaseUrl/api/esp32/end-call'),
@@ -565,8 +511,9 @@ class _ConserjeScreenState extends State<ConserjeScreen>
           'rut_emisor': payload['caller_rut']?.toString(),
           'rut_receptor': miRut,
           'tipo_llamada': 'audio',
-          'estado': 'rechazada',
-          'reason': 'rechazada',
+          'estado': estado,
+          'only_if_ringing': sinRespuesta,
+          'reason': reason,
           'duracion_segundos': 0,
         }),
       );
@@ -920,6 +867,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
 
   void _cerrarSesion() async {
     _cerrandoSesion = true;
+    _llamadaEntrante?.close();
     if (_socketInicializado) EmergencyService.instance.detachSocket(socket);
     if (_socketInicializado) socket.disconnect();
     await NotificationHistoryService.clearSession();
@@ -929,6 +877,8 @@ class _ConserjeScreenState extends State<ConserjeScreen>
 
   @override
   void dispose() {
+    _llamadaEntrante?.dispose();
+    _llamadaEntrante = null;
     WidgetsBinding.instance.removeObserver(this);
     NotificationHistoryService.changes.removeListener(_actualizarNotificaciones);
     if (_socketInicializado) EmergencyService.instance.detachSocket(socket);
