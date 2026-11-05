@@ -20,6 +20,8 @@ import '../widgets/mensajes_modal.dart';
 import '../widgets/puertas_modal.dart';
 import '../widgets/horarios_modal.dart';
 import '../widgets/notificaciones_panel_modal.dart';
+import '../widgets/historial_modal.dart';
+import '../widgets/recados_modal.dart';
 import '../helpers/message_navigation.dart';
 import '../services/esp32_audio_bridge.dart';
 import '../services/notification_history_service.dart';
@@ -751,6 +753,45 @@ class _ConserjeScreenState extends State<ConserjeScreen>
     );
   }
 
+  void _abrirNotificacion(NotificationHistoryEntry notificacion) {
+    if (!mounted || _cerrandoSesion || miRut.isEmpty) return;
+
+    final Widget destino;
+    switch (notificacion.type) {
+      case 'chat_message':
+        _abrirMensajes();
+        return;
+      case 'call':
+      case 'incoming_call':
+      case 'call_record':
+      case 'outgoing_call':
+      case 'audio':
+      case 'audio_call':
+      case 'video':
+      case 'video_call':
+      case 'missed_call':
+        destino = HistorialModal(miRut: miRut);
+        break;
+      case 'recado':
+      case 'recado_created':
+      case 'recado_resolved':
+        destino = RecadosModal(miRut: miRut, mostrarComoMensajes: true);
+        break;
+      case 'door_opening':
+        destino = PuertasModal(miRut: miRut);
+        break;
+      default:
+        return;
+    }
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => destino,
+    );
+  }
+
   void _abrirPuertas() {
     showModalBottomSheet<void>(
       context: context,
@@ -979,9 +1020,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
                     loading: _loadingNotificaciones,
                     error: _errorNotificaciones,
                     onDismiss: _descartarNotificacion,
-                    onTap: (notificacion) {
-                      if (notificacion.type == 'chat_message') _abrirMensajes();
-                    },
+                    onTap: _abrirNotificacion,
                   ),
                 ),
               ],

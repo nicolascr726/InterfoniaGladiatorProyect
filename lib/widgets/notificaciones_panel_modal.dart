@@ -165,7 +165,7 @@ class _NotificacionesPanelState extends State<NotificacionesPanel> {
   Widget _notificacion(NotificationHistoryEntry notificacion) {
     final color = _color(notificacion.type);
     return InkWell(
-      onTap: widget.onTap == null || notificacion.type != 'chat_message'
+      onTap: widget.onTap == null
           ? null
           : () => widget.onTap!(notificacion),
       child: Padding(
