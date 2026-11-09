@@ -753,8 +753,12 @@ class _ConserjeScreenState extends State<ConserjeScreen>
     );
   }
 
-  void _abrirNotificacion(NotificationHistoryEntry notificacion) {
+  Future<void> _abrirNotificacion(NotificationHistoryEntry notificacion) async {
     if (!mounted || _cerrandoSesion || miRut.isEmpty) return;
+
+    final rut = miRut;
+    await _descartarNotificacion(notificacion);
+    if (!mounted || _cerrandoSesion || miRut != rut) return;
 
     final Widget destino;
     switch (notificacion.type) {

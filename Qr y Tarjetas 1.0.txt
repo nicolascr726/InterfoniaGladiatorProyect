@@ -1,0 +1,281 @@
+/*
+  Lector QR/RFID + MP3 + un rele: PUERTA 3.
+  Placa: ESP32
+
+  Configurar WIFI_SSID, WIFI_PASSWORD y RFID_READER_TOKEN antes de cargar.
+  RFID_READER_TOKEN debe coincidir con la variable del mismo nombre en Flask.
+  Registrar las tarjetas mediante /api/rfid antes de utilizarlas.
+
+  El servidor valida la tarjeta, registra la autorizacion y aplica 15 segundos
+  de espera por tarjeta. Solo se abre ante HTTP 200 y autorizado=true para
+  puerta 3. Sin red, hora valida, TLS o autorizacion, el rele permanece apagado.
+  La respuesta autoriza el acceso; no confirma la apertura fisica de la puerta.
+
+  Este lector tambien puede leer QR, pero la API actual solo admite numeros
+  RFID registrados (1 a 32 digitos). ACCESOQR_1 y ACCESOQR_3 no dan acceso.
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+#define RXD2 16
+#define TXD2 17
+#define RELAY_PIN 18
+#define MP3_TX_PIN 21
+#define MP3_RX_PIN 22
+
+const char* WIFI_SSID = "Wifi_Mesh-8390ACB7";
+const char* WIFI_PASSWORD = "aGUzw6nR";
+const char* RFID_READER_TOKEN = "afdc8a972a767f0b5f4bcf9a9a3d2e30d546a05d4cb0ac4551ffd8ce842117ba";
+const char* RFID_VALIDAR_URL =
+    "https://video.gladiatorcontrolbase.com/api/rfid/validar";
+
+const int PUERTA = 3;
+const unsigned long TIEMPO_APERTURA_MS = 5000;
+const unsigned long REINTENTO_WIFI_MS = 10000;
+const unsigned long FIN_LECTURA_MS = 50;
+const unsigned long RESPUESTA_MAX_MS = 10000;
+const size_t MAX_NUMERO_TARJETA = 32;
+
+HardwareSerial SerialMP3(1);
+// Conservar el cliente evita repetir la negociacion TLS si hay keep-alive.
+WiFiClientSecure clienteSeguro;
+HTTPClient http;
+bool httpIniciado = false;
+String tokenLeido;
+bool lecturaInvalida = false;
+bool releActivo = false;
+bool relojConfigurado = false;
+unsigned long ultimaRecepcion = 0;
+unsigned long aperturaIniciada = 0;
+unsigned long ultimoReintentoWiFi = 0;
+
+void enviarComandoMP3(byte comando, byte parametro1, byte parametro2) {
+  byte trama[10] = {0x7E, 0xFF, 0x06, comando, 0x00,
+                    parametro1, parametro2, 0x00, 0x00, 0xEF};
+  int16_t checksum = -(trama[1] + trama[2] + trama[3] + trama[4] +
+                       trama[5] + trama[6]);
+  trama[7] = (byte)(checksum >> 8);
+  trama[8] = (byte)(checksum & 0xFF);
+  SerialMP3.write(trama, sizeof(trama));
+  delay(50);
+}
+
+void denegarAcceso(const String& motivo) {
+  Serial.print("[PUERTA 3] Acceso denegado: ");
+  Serial.println(motivo);
+  enviarComandoMP3(0x12, 0x00, 2);
+}
+
+void descartarLecturasPendientes() {
+  // El FIFO y el buffer de recepcion son finitos; no esperar datos nuevos.
+  int pendientes = Serial2.available();
+  while (pendientes-- > 0) Serial2.read();
+  tokenLeido = "";
+  lecturaInvalida = false;
+}
+
+void concederAcceso(const String& numeroTarjeta, const char* nombreCompleto,
+                    const char* rutUsuario,
+                    const char* departamento, unsigned long validacionMs) {
+  // Abrir en cuanto se valida la respuesta, antes del aviso MP3 y su espera.
+  aperturaIniciada = millis();
+  releActivo = true;
+  digitalWrite(RELAY_PIN, LOW);
+  Serial.printf("[PUERTA 3] Acceso autorizado | Nombre: %s | RUT: %s | Dpto: %s | Tarjeta: %s | Validacion: %lu ms | Apertura: 5 segundos\n",
+                nombreCompleto, rutUsuario, departamento, numeroTarjeta.c_str(), validacionMs);
+  enviarComandoMP3(0x12, 0x00, 1);
+}
+
+void revisarRele() {
+  if (releActivo && millis() - aperturaIniciada >= TIEMPO_APERTURA_MS) {
+    digitalWrite(RELAY_PIN, HIGH);
+    releActivo = false;
+    descartarLecturasPendientes();
+    Serial.println("[PUERTA 3] Rele apagado.");
+  }
+}
+
+void cerrarConexionBackend() {
+  // Descartar conexiones con errores sin repetir una solicitud de apertura.
+  http.setReuse(false);
+  http.end();
+  clienteSeguro.stop();
+  httpIniciado = false;
+}
+
+bool prepararConexionBackend() {
+  if (httpIniciado) return true;
+  if (!http.begin(clienteSeguro, RFID_VALIDAR_URL)) return false;
+  http.setReuse(true);
+  http.setConnectTimeout(4000);
+  http.setTimeout(4000);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  httpIniciado = true;
+  return true;
+}
+
+void gestionarRed() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!relojConfigurado) {
+      // La hora permite verificar la vigencia del certificado HTTPS.
+      configTime(0, 0, "pool.ntp.org", "time.google.com");
+      relojConfigurado = true;
+      Serial.println("[RED] Wi-Fi conectado; sincronizando reloj.");
+    }
+    return;
+  }
+  if (httpIniciado) cerrarConexionBackend();
+  if (millis() - ultimoReintentoWiFi >= REINTENTO_WIFI_MS) {
+    ultimoReintentoWiFi = millis();
+    WiFi.reconnect();
+  }
+}
+
+void validarYConceder(const String& numeroTarjeta) {
+  if (strcmp(RFID_READER_TOKEN, "CONFIGURAR_TOKEN_RFID") == 0 ||
+      strlen(RFID_READER_TOKEN) == 0) {
+    denegarAcceso("Configura RFID_READER_TOKEN en el lector y en Flask.");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    denegarAcceso("Sin conexion Wi-Fi.");
+    return;
+  }
+  if (time(nullptr) < 1700000000) {
+    denegarAcceso("Reloj sin sincronizar; espera a que termine la conexion.");
+    return;
+  }
+
+  if (!prepararConexionBackend()) {
+    denegarAcceso("No se pudo iniciar la consulta al servidor.");
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + RFID_READER_TOKEN);
+
+  JsonDocument solicitud;
+  solicitud["numero_tarjeta"] = numeroTarjeta;  // Texto: conserva ceros iniciales.
+  solicitud["puerta"] = PUERTA;
+  String cuerpo;
+  serializeJson(solicitud, cuerpo);
+  unsigned long inicioConsulta = millis();
+  int estado = http.POST(cuerpo);
+  String respuesta;
+  if (estado > 0 && http.getSize() <= 2048) respuesta = http.getString();
+  unsigned long validacionMs = millis() - inicioConsulta;
+  // Consumir el cuerpo completo permite reutilizar la conexion. Si el servidor
+  // la cierra, HTTPClient conectara de nuevo en la siguiente lectura.
+  descartarLecturasPendientes();
+
+  // No reintentar una consulta que pudo haberse autorizado antes de perder red.
+  if (estado <= 0 || validacionMs > RESPUESTA_MAX_MS ||
+      respuesta.length() == 0 || respuesta.length() > 2048) {
+    cerrarConexionBackend();
+    denegarAcceso("Fallo o demora en la respuesta del servidor.");
+    return;
+  }
+  JsonDocument documento;
+  if (deserializeJson(documento, respuesta)) {
+    cerrarConexionBackend();
+    denegarAcceso("Respuesta JSON invalida.");
+    return;
+  }
+  if (estado == 429) {
+    Serial.print("[PUERTA 3] Tiempo de espera. Segundos restantes: ");
+    Serial.println(documento["reintentar_en_segundos"] | 15);
+    enviarComandoMP3(0x12, 0x00, 3);
+    return;
+  }
+  if (estado != 200 || !documento["success"].is<bool>() ||
+      !documento["success"].as<bool>() ||
+      !documento["autorizado"].is<bool>() ||
+      !documento["autorizado"].as<bool>()) {
+    denegarAcceso(documento["error"] | "El servidor rechazo el acceso.");
+    return;
+  }
+  if (!documento["puerta"].is<int>() || documento["puerta"].as<int>() != PUERTA ||
+      String(documento["accion"] | "") != "abrir" ||
+      !documento["tiempo_apertura_ms"].is<unsigned long>() ||
+      documento["tiempo_apertura_ms"].as<unsigned long>() != TIEMPO_APERTURA_MS) {
+    denegarAcceso("La autorizacion no corresponde a la puerta 3.");
+    return;
+  }
+  // Estos datos pertenecen al registro autorizado devuelto por el servidor.
+  const char* rutUsuario = documento["registro"]["rut_emisor"] | "No informado";
+  const char* departamento = documento["registro"]["id_dpto"] | "Sin departamento";
+  const char* nombreCompleto = documento["nombre_completo"] | "No informado";
+  concederAcceso(numeroTarjeta, nombreCompleto, rutUsuario, departamento, validacionMs);
+}
+
+void finalizarLectura() {
+  if (tokenLeido.length() == 0 && !lecturaInvalida) return;
+  String numero = tokenLeido;
+  bool invalida = lecturaInvalida;
+  tokenLeido = "";
+  lecturaInvalida = false;
+  if (invalida) {
+    denegarAcceso("Se requiere un numero RFID de 1 a 32 digitos registrado.");
+  } else {
+    validarYConceder(numero);
+  }
+}
+
+void leerCredencial() {
+  // No acumular ordenes durante una apertura ni prolongar el pulso del rele.
+  if (releActivo) {
+    descartarLecturasPendientes();
+    return;
+  }
+  int procesados = 0;
+  while (Serial2.available() && procesados++ < 64) {
+    char c = (char)Serial2.read();
+    ultimaRecepcion = millis();
+    if (c == '\r' || c == '\n' || c == 0x03) {
+      finalizarLectura();
+      if (releActivo) return;
+    } else if (c == 0x02 && tokenLeido.length() == 0 && !lecturaInvalida) {
+      // STX opcional al comienzo de la trama.
+    } else if (c >= '0' && c <= '9' && tokenLeido.length() < MAX_NUMERO_TARJETA) {
+      tokenLeido += c;
+    } else {
+      // Rechazar la trama completa; nunca quitar letras para fabricar un numero.
+      lecturaInvalida = true;
+    }
+  }
+  if (!Serial2.available() && millis() - ultimaRecepcion >= FIN_LECTURA_MS) {
+    finalizarLectura();
+  }
+}
+
+void setup() {
+  // El rele es activo en LOW; arrancar con su salida apagada.
+  digitalWrite(RELAY_PIN, HIGH);
+  pinMode(RELAY_PIN, OUTPUT);
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  SerialMP3.begin(9600, SERIAL_8N1, MP3_RX_PIN, MP3_TX_PIN);
+  tokenLeido.reserve(MAX_NUMERO_TARJETA);
+  delay(1000);
+  enviarComandoMP3(0x06, 0x00, 25);
+  // Configurar TLS una sola vez y conservar la verificacion de certificados.
+  clienteSeguro.useBuiltinCACertBundle();
+  clienteSeguro.setHandshakeTimeout(4);
+  WiFi.mode(WIFI_STA);
+  // Reduce la espera del modem Wi-Fi entre el escaneo y la consulta HTTPS.
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  ultimoReintentoWiFi = millis();
+  Serial.println("[PUERTA 3] Sistema iniciado. Esperando red y lectura RFID.");
+}
+
+void loop() {
+  revisarRele();
+  gestionarRed();
+  leerCredencial();
+  delay(1);
+}

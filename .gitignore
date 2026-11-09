@@ -49,3 +49,5 @@ app.*.map.json
 # Configuración privada de correo (incluye contraseña de aplicación).
 /correo_config.json
 /correo_config.json.*
+*.py
+/test
