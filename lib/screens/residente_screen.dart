@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -41,7 +43,13 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
   final _ringtonePlayer = FlutterRingtonePlayer();
   IncomingCallDialog? _llamadaEntrante;
 
-  void _tocarTono() => _ringtonePlayer.playRingtone();
+  void _tocarTono() {
+    final estado = WidgetsBinding.instance.lifecycleState;
+    if (!Platform.isAndroid ||
+        (estado != AppLifecycleState.hidden && estado != AppLifecycleState.paused)) {
+      _ringtonePlayer.playRingtone();
+    }
+  }
   void _detenerTono() => _ringtonePlayer.stop();
 
   // Función para registrar y actualizar el Token FCM
@@ -213,6 +221,10 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
   }
 
   bool _cerrarDialogoEntrante(dynamic data) {
+    final callId = data is Map ? data['call_id']?.toString() ?? '' : '';
+    if (Platform.isAndroid && callId.isNotEmpty) {
+      unawaited(CallNotifications.markEnded(callId));
+    }
     final dialog = _llamadaEntrante;
     if (dialog != null && !dialog.matches(data)) return false;
     if (dialog != null) {
@@ -227,11 +239,24 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
     if (!mounted || _cerrandoSesion || _llamadaEntrante != null) return;
 
     final payload = data is Map ? Map<dynamic, dynamic>.from(data) : <dynamic, dynamic>{};
+    final callId = payload['call_id']?.toString() ?? '';
+    if (callId.isNotEmpty) {
+      if (IncomingCallDialog.isShowing(callId) ||
+          (Platform.isAndroid && await CallNotifications.hasEnded(callId))) {
+        return;
+      }
+      if (!mounted || _cerrandoSesion || _llamadaEntrante != null) return;
+    }
     final esCitofono = isCitofonoAudioCall(payload);
     final dialog = IncomingCallDialog(
       payload: payload,
       isCitofono: esCitofono,
-      onStopRinging: _detenerTono,
+      onStopRinging: () {
+        _detenerTono();
+        if (Platform.isAndroid && callId.isNotEmpty) {
+          unawaited(CallNotifications.markEnded(callId));
+        }
+      },
       resetHandset: esCitofono ? Esp32AudioBridge.resetHandsetState : null,
       isHandsetLifted: esCitofono
           ? () async => (await Esp32AudioBridge.getHandsetState())['handsetLifted'] == true
@@ -267,6 +292,7 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
               socket: socket,
               miRut: miRut,
               rutDestino: payload['caller_rut']?.toString() ?? '',
+              callId: callId,
             ),
     ));
   }
@@ -276,7 +302,10 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
     final bool esCitofono = isCitofonoAudioCall(payload);
 
     if (!esCitofono) {
-      socket.emit(sinRespuesta ? 'end-call' : 'busy', {'room': payload['caller_rut']});
+      socket.emit(sinRespuesta ? 'end-call' : 'busy', {
+        'room': payload['caller_rut'],
+        'call_id': payload['call_id'],
+      });
       if (sinRespuesta) socket.emit('free-rut', {'rut': miRut});
       return;
     }
@@ -364,7 +393,8 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
                   tipo: tipo,
                   socket: socket,
                   miRut: miRut,
-                  rutDestino: rut, // A quien estoy llamando
+                  rutDestino: data['target_rut']?.toString() ?? rut,
+                  callId: data['call_id']?.toString(),
                 ),
         ));
       } else {

@@ -13,6 +13,7 @@ class LlamadaScreen extends StatefulWidget {
   final IO.Socket? socket;
   final String miRut;
   final String rutDestino; // RUT de la otra persona (el que NO soy yo)
+  final String? callId;
 
   const LlamadaScreen({
     super.key,
@@ -22,6 +23,7 @@ class LlamadaScreen extends StatefulWidget {
     this.socket,
     required this.miRut,
     required this.rutDestino,
+    this.callId,
   });
 
   @override
@@ -37,6 +39,7 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
   bool _callEnded = false;
   DateTime? _connectedAt;
   late IO.Socket _socket;
+  final _desuscribirSocket = <VoidCallback>[];
   Timer? _timeoutTimer;
   Timer? _durationTimer;
 
@@ -116,14 +119,30 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       _socket = IO.io(kBaseUrl, <String, dynamic>{
         'transports': ['websocket'],
         'autoConnect': false,
+        'forceNew': true,
       });
-      _socket.connect();
     }
+    _escucharSocket('end-call', (data) {
+      if (_coincideLlamada(data)) _finalizar(remoto: true);
+    });
+    _escucharSocket('missed-call', (_) => _finalizar(remoto: true));
+    _escucharSocket('busy', (data) {
+      if (!_coincideLlamada(data) || !mounted || _callEnded) return;
+      _finalizar(remoto: true, rechazada: true);
+    });
+    if (widget.socket == null) _socket.connect();
+  }
+
+  void _escucharSocket(String evento, void Function(dynamic) handler) {
+    _socket.on(evento, handler);
+    _desuscribirSocket.add(() => _socket.off(evento, handler));
   }
 
   Future<void> _initCall() async {
     await _localRenderer.initialize();
+    if (!mounted || _callEnded) return;
     await _remoteRenderer.initialize();
+    if (!mounted || _callEnded) return;
     await _startCall();
   }
 
@@ -152,8 +171,13 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
 
   Future<void> _startCall() async {
     final iceConfig = await _getIceServers();
-
-    _peerConnection = await createPeerConnection(iceConfig);
+    if (!mounted || _callEnded) return;
+    final peer = await createPeerConnection(iceConfig);
+    if (!mounted || _callEnded) {
+      await peer.dispose();
+      return;
+    }
+    _peerConnection = peer;
 
     _peerConnection!.onIceCandidate = (candidate) {
       _socket.emit('ice-candidate', {
@@ -186,7 +210,15 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
           };
 
     try {
-      _localStream = await navigator.mediaDevices.getUserMedia(constraints);
+      final stream = await navigator.mediaDevices.getUserMedia(constraints);
+      if (!mounted || _callEnded) {
+        for (final track in stream.getTracks()) {
+          await track.stop();
+        }
+        await stream.dispose();
+        return;
+      }
+      _localStream = stream;
       _localRenderer.srcObject = _localStream;
       _localStream!.getTracks().forEach((track) {
         _peerConnection!.addTrack(track, _localStream!);
@@ -199,9 +231,10 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
     } catch (e) {
       if (mounted) setState(() => _status = 'Error al acceder a la cámara: $e');
     }
+    if (!mounted || _callEnded) return;
 
     // Escuchar señales WebRTC
-    _socket.on('offer', (data) async {
+    _escucharSocket('offer', (data) async {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Recibiendo Offer...')));
       await _peerConnection!.setRemoteDescription(
         RTCSessionDescription(data['sdp']['sdp'], data['sdp']['type']),
@@ -214,7 +247,7 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       if (mounted) setState(() => _status = 'Llamada conectada');
     });
 
-    _socket.on('answer', (data) async {
+    _escucharSocket('answer', (data) async {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Recibiendo Answer...')));
       await _peerConnection!.setRemoteDescription(
         RTCSessionDescription(data['sdp']['sdp'], data['sdp']['type']),
@@ -223,7 +256,7 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       if (mounted) setState(() => _status = 'Llamada conectada');
     });
 
-    _socket.on('ice-candidate', (data) async {
+    _escucharSocket('ice-candidate', (data) async {
       try {
         final c = data['candidate'];
         await _peerConnection!.addCandidate(
@@ -232,44 +265,70 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       } catch (_) {}
     });
 
-    _socket.on('end-call', (_) => _finalizar(remoto: true));
-    _socket.on('missed-call', (_) => _finalizar(remoto: true));
-    _socket.on('busy', (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Llamada rechazada')),
-        );
-      }
-      _finalizar(remoto: true);
-    });
+    if (widget.isCaller) {
+      _escucharSocket('ready', (data) async {
+        if (!mounted || _callEnded || !_coincideLlamada(data)) return;
+        final offer = await peer.createOffer();
+        if (!mounted || _callEnded) return;
+        await peer.setLocalDescription(offer);
+        if (!mounted || _callEnded) return;
+        _socket.emit('offer', {'room': widget.room, 'sdp': offer.toMap()});
+      });
+    }
 
     // Unirse a la sala cuando el socket esté conectado
     void unirseSala() {
+      if (!mounted || _callEnded) return;
       if (widget.isCaller) {
         setState(() => _status = 'Esperando que contesten...');
-        _socket.on('ready', (_) async {
-          final offer = await _peerConnection!.createOffer();
-          await _peerConnection!.setLocalDescription(offer);
-          _socket.emit('offer', {'room': widget.room, 'sdp': offer.toMap()});
-        });
       } else {
         setState(() => _status = 'Conectando video...');
       }
-      _socket.emit('join-call', {'room': widget.room, 'mi_rut': widget.miRut});
+      _socket.emit('join-call', {
+        'room': widget.room,
+        'mi_rut': widget.miRut,
+        if (widget.callId?.isNotEmpty == true)
+          'call_id': widget.callId,
+      });
       debugPrint('📡 Emitido join-call a la sala ${widget.room} con mi_rut ${widget.miRut}');
     }
 
     if (_socket.connected) {
       unirseSala();
     } else {
-      _socket.onConnect((_) => unirseSala());
-      _socket.onConnectError((e) {
+      _escucharSocket('connect', (_) => unirseSala());
+      _escucharSocket('connect_error', (e) {
         if (mounted) setState(() => _status = 'Error de socket: $e');
       });
     }
   }
 
-  Future<void> _finalizar({bool remoto = false}) async {
+  bool _coincideLlamada(dynamic data) {
+    final id = data is Map ? data['call_id']?.toString() : null;
+    final callId = widget.callId;
+    return id == null ||
+        id.isEmpty ||
+        callId == null ||
+        callId.isEmpty ||
+        id == callId;
+  }
+
+  void _avisarCierre() {
+    _socket.emit('end-call', {'room': widget.room, 'call_id': widget.callId});
+    if (widget.isCaller && _status != 'Llamada conectada') {
+      _socket.emit('end-call', {
+        'room': widget.rutDestino,
+        'call_id': widget.callId,
+      });
+      _socket.emit('missed-call', {
+        'room': widget.rutDestino,
+        'caller_rut': widget.miRut,
+        'reason': 'cancelada',
+      });
+    }
+  }
+
+  Future<void> _finalizar({bool remoto = false, bool rechazada = false}) async {
     if (_callEnded) return;
     _callEnded = true;
     _durationTimer?.cancel();
@@ -279,21 +338,24 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       _socket.emit('free-rut', {'rut': widget.miRut});
     }
 
-    if (!remoto) {
-      _socket.emit('end-call', {'room': widget.room});
-      if (widget.isCaller && _status != 'Llamada conectada') {
-        // Emitir a la sala del destino para que se le cierre el modal y deje de sonar
-        _socket.emit('end-call', {'room': widget.rutDestino});
-        _socket.emit('missed-call', {
-          'room': widget.rutDestino,
-          'caller_rut': widget.miRut,
-          'reason': 'cancelada'
-        });
-      }
-    }
+    if (!remoto) _avisarCierre();
 
     _peerConnection?.close();
     _localStream?.getTracks().forEach((t) => t.stop());
+
+    if (mounted) {
+      if (remoto) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(rechazada ? 'Llamada rechazada' : 'La otra persona colgó')),
+        );
+      }
+      final ruta = ModalRoute.of(context);
+      if (ruta?.isCurrent == true) {
+        ruta?.navigator?.pop();
+      } else if (ruta != null && ruta.isActive) {
+        ruta.navigator?.removeRoute(ruta);
+      }
+    }
 
     // Ambos lados guardan su propio registro (emisor y receptor son siempre correctos)
     try {
@@ -307,7 +369,7 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
           'estado': (widget.isCaller && _status != 'Llamada conectada') ? 'perdida' : 'finalizada',
           'duracion_segundos': _connectedAt == null ? 0 : DateTime.now().difference(_connectedAt!).inSeconds,
         }),
-      );
+      ).timeout(const Duration(seconds: 10));
     } catch (_) {}
 
     // Se guarda un mensaje genérico en el chat por el registro de la llamada
@@ -339,29 +401,18 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       }
     }
 
-    if (mounted) {
-      if (remoto) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('La otra persona colgó')),
-        );
-      }
-      Navigator.pop(context);
-    }
   }
 
   @override
   void dispose() {
+    if (!_callEnded && widget.isCaller && _connectedAt == null) _avisarCierre();
     _timeoutTimer?.cancel();
     _durationTimer?.cancel();
     _localRenderer.dispose();
     _remoteRenderer.dispose();
-    _socket.off('offer');
-    _socket.off('answer');
-    _socket.off('ice-candidate');
-    _socket.off('end-call');
-    _socket.off('missed-call');
-    _socket.off('busy');
-    _socket.off('ready');
+    for (final desuscribir in _desuscribirSocket) {
+      desuscribir();
+    }
     if (widget.socket == null) {
       // Solo matar el socket si lo creamos aquí
       _socket.dispose();

@@ -11,6 +11,8 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
+import android.os.Bundle
+import android.util.Log
 import android.view.KeyEvent
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -22,6 +24,8 @@ import kotlin.math.max
 
 class MainActivity : FlutterActivity() {
     private val channelName = "gladiator/citofono_audio_track"
+    private var callActionsChannel: MethodChannel? = null
+    private var pendingAcceptedCall: String? = null
     private var audioTrack: AudioTrack? = null
     private var currentSampleRate: Int = 8000
 
@@ -53,6 +57,29 @@ class MainActivity : FlutterActivity() {
         controller.hide(WindowInsetsCompat.Type.navigationBars())
     }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        captureAcceptedCall(intent)
+        super.onCreate(savedInstanceState)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        captureAcceptedCall(intent)
+        super.onNewIntent(intent)
+        if (pendingAcceptedCall != null) {
+            callActionsChannel?.invokeMethod("acceptedCallAvailable", null)
+        }
+    }
+
+    private fun captureAcceptedCall(intent: Intent?) {
+        // Intent de la acción con interfaz de flutter_local_notifications 18.
+        if (intent?.action != "SELECT_FOREGROUND_NOTIFICATION" ||
+            (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0 ||
+            intent.getStringExtra("actionId") != "accept_call") return
+        val payload = intent.getStringExtra("payload") ?: return
+        pendingAcceptedCall = payload
+        Log.i("CitofonoCall", "Android recibió Aceptar")
+    }
+
     override fun onPostResume() {
         super.onPostResume()
         window.decorView.post {
@@ -71,6 +98,20 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        callActionsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger, "gladiator/call_notification_actions"
+        ).apply {
+            setMethodCallHandler { call, result ->
+                if (call.method == "takeAcceptedCall") {
+                    val payload = pendingAcceptedCall
+                    pendingAcceptedCall = null
+                    result.success(payload)
+                } else {
+                    result.notImplemented()
+                }
+            }
+        }
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
@@ -514,6 +555,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        callActionsChannel?.setMethodCallHandler(null)
+        callActionsChannel = null
         stopAudioTrack()
         unregisterHookReceiver()
         try {

@@ -347,6 +347,7 @@ class _RecadosModalState extends State<RecadosModal> {
                 socket: socketLlamada,
                 miRut: widget.miRut,
                 rutDestino: destino,
+                callId: callId,
               ),
       ));
     } finally {

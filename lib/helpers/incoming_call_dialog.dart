@@ -20,6 +20,19 @@ class IncomingCallDialog {
   final Future<void> Function()? resetHandset;
   final Future<bool> Function()? isHandsetLifted;
 
+  static final _visible = <String, IncomingCallDialog>{};
+
+  static bool isShowing(String callId) => _visible.containsKey(callId);
+
+  static bool resolve(String callId, IncomingCallDecision decision) {
+    final dialog = _visible[callId];
+    if (dialog == null || dialog._route?.isActive != true) return false;
+    dialog.close(decision);
+    return true;
+  }
+
+  String get _callId => payload['call_id']?.toString() ?? '';
+
   DialogRoute<IncomingCallDecision>? _route;
   Timer? _timeoutTimer;
   Timer? _handsetTimer;
@@ -94,6 +107,7 @@ class IncomingCallDialog {
       ),
     );
     _route = route;
+    if (_callId.isNotEmpty) _visible[_callId] = this;
     final result = navigator.push(route);
     _timeoutTimer = Timer(
       remaining,
@@ -127,6 +141,7 @@ class IncomingCallDialog {
   void _cleanup() {
     if (_closed) return;
     _closed = true;
+    if (identical(_visible[_callId], this)) _visible.remove(_callId);
     _timeoutTimer?.cancel();
     _handsetTimer?.cancel();
     onStopRinging();
