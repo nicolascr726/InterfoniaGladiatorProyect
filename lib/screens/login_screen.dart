@@ -20,6 +20,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final _rutController = TextEditingController();
   final _claveController = TextEditingController();
   bool _loading = false;
+  bool _ocultarClave = true;
 
   Future<void> _login() async {
     final rut = _rutController.text.trim();
@@ -207,12 +208,20 @@ class _LoginScreenState extends State<LoginScreen> {
                     // Campo Clave
                     TextField(
                       controller: _claveController,
-                      obscureText: true,
+                      obscureText: _ocultarClave,
                       style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
                         labelText: 'Contraseña',
                         labelStyle: const TextStyle(color: Colors.white54),
                         prefixIcon: const Icon(Icons.lock_outline_rounded, color: Color(0xFF6366F1)),
+                        suffixIcon: IconButton(
+                          onPressed: () => setState(() => _ocultarClave = !_ocultarClave),
+                          tooltip: _ocultarClave ? 'Mostrar contraseña' : 'Ocultar contraseña',
+                          icon: Icon(
+                            _ocultarClave ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                            color: const Color(0xFF6366F1),
+                          ),
+                        ),
                         filled: true,
                         fillColor: const Color(0xFF0B0F19),
                         enabledBorder: OutlineInputBorder(

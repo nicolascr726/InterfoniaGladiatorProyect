@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 import '../config.dart';
+import '../helpers/citofono_call_utils.dart';
 import '../screens/citofono_audio_screen.dart';
 import 'mensajes_modal.dart';
 
@@ -13,6 +14,7 @@ class DirectorioModal extends StatefulWidget {
   final http.Client? client;
   final Set<String> rutosOcupados;
   final Function(String rut, String tipo) onLlamar;
+  final bool mostrarCitofonos;
   // --- NUEVO: Recibe el mapa con los mensajes sin leer por remitente ---
   final Map<String, int> mensajesSinLeerPorUsuario;
 
@@ -22,6 +24,7 @@ class DirectorioModal extends StatefulWidget {
     this.client,
     required this.rutosOcupados,
     required this.onLlamar,
+    this.mostrarCitofonos = true,
     this.mensajesSinLeerPorUsuario = const {}, // Por defecto vacío por si acaso
   });
 
@@ -265,7 +268,12 @@ class _DirectorioModalState extends State<DirectorioModal> {
   }
 
   void _reconstruirContactos() {
-    _usuarios = [..._citofonos, ..._contactosUsuarios];
+    _usuarios = [..._citofonos, ..._contactosUsuarios].where((usuario) {
+      final esCitofono = usuario['es_citofono'] == true ||
+          usuario['es_citofono'] == 1 ||
+          isCitofonoValue(usuario['rut_usuario']);
+      return widget.mostrarCitofonos || !esCitofono;
+    }).toList();
     _filtrados = _buscar(_searchCtrl.text);
   }
 

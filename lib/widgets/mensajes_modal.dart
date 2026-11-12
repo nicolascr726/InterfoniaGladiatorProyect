@@ -318,83 +318,6 @@ class _MensajesModalState extends State<MensajesModal> {
     }
   }
 
-  Future<void> _eliminarMensaje(int mensajeId) async {
-    try {
-      final res = await http
-          .delete(
-        Uri.parse('$kBaseUrl/api/chat/message/$mensajeId'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'rut': widget.miRut}),
-      )
-          .timeout(const Duration(seconds: 10));
-
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      if (res.statusCode != 200 || data['success'] != true) {
-        throw Exception(data['error'] ?? res.body);
-      }
-      await _cargarMensajes(silencioso: true);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('No se pudo eliminar el mensaje: $e')),
-      );
-    }
-  }
-
-  Future<void> _vaciarChat() async {
-    final contacto = _contactoSeleccionado;
-    if (contacto == null) return;
-
-    bool? confirmar = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF222233),
-        title: const Text('Vaciar chat', style: TextStyle(color: Colors.white)),
-        content: const Text(
-          '¿Estás seguro de que deseas eliminar todos los mensajes de esta conversación?',
-          style: TextStyle(color: Colors.white70),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child:
-            const Text('Vaciar', style: TextStyle(color: Colors.redAccent)),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmar != true) return;
-
-    try {
-      final res = await http
-          .delete(
-        Uri.parse('$kBaseUrl/api/chat/clear'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'rut': widget.miRut,
-          'peer': _contactoRut(contacto),
-        }),
-      )
-          .timeout(const Duration(seconds: 10));
-
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      if (res.statusCode != 200 || data['success'] != true) {
-        throw Exception(data['error'] ?? res.body);
-      }
-      await _cargarMensajes(silencioso: true);
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('No se pudo vaciar el chat: $e')),
-      );
-    }
-  }
-
   void _mostrarOpcionesImagen() {
     showModalBottomSheet(
       context: context,
@@ -548,23 +471,6 @@ class _MensajesModalState extends State<MensajesModal> {
           IconButton(
             icon: const Icon(Icons.refresh_rounded, color: Color(0xFF448AFF)),
             onPressed: _cargarContactos,
-          )
-        else
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert_rounded, color: Colors.white),
-            color: const Color(0xFF222233),
-            onSelected: (value) {
-              if (value == 'vaciar') {
-                _vaciarChat();
-              }
-            },
-            itemBuilder: (BuildContext context) => [
-              const PopupMenuItem<String>(
-                value: 'vaciar',
-                child: Text('Vaciar conversación',
-                    style: TextStyle(color: Colors.white)),
-              ),
-            ],
           ),
       ],
     );
@@ -653,113 +559,82 @@ class _MensajesModalState extends State<MensajesModal> {
                 final m = _mensajes[index];
                 final propio =
                     (m['rut_emisor'] ?? '').toString() == widget.miRut;
-                final mensajeId = m['id'];
                 final leido = m['leido'] == true || m['leido'] == 1;
 
-                final burbuja = GestureDetector(
-                  onLongPress: () {
-                    showModalBottomSheet(
-                      context: context,
-                      backgroundColor: const Color(0xFF222233),
-                      builder: (ctx) => SafeArea(
-                        child: Wrap(
-                          children: [
-                            ListTile(
-                              leading: const Icon(
-                                Icons.delete_rounded,
-                                color: Colors.redAccent,
+                final burbuja = Align(
+                  alignment: propio
+                      ? Alignment.centerRight
+                      : Alignment.centerLeft,
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 9),
+                    constraints: BoxConstraints(
+                      maxWidth:
+                      MediaQuery.of(context).size.width * 0.72,
+                    ),
+                    decoration: BoxDecoration(
+                      color: propio
+                          ? const Color(0xFF448AFF)
+                          : const Color(0xFF333344),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: propio
+                          ? CrossAxisAlignment.end
+                          : CrossAxisAlignment.start,
+                      children: [
+                        if (m['es_imagen'] == true)
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.network(
+                              '$kBaseUrl${m['mensaje']}',
+                              fit: BoxFit.cover,
+                              errorBuilder:
+                                  (context, error, stackTrace) =>
+                              const Icon(
+                                Icons.broken_image,
+                                color: Colors.white54,
                               ),
-                              title: const Text(
-                                'Eliminar mensaje',
-                                style: TextStyle(color: Colors.white),
-                              ),
-                              onTap: () {
-                                Navigator.pop(ctx);
-                                if (mensajeId != null) {
-                                  _eliminarMensaje(mensajeId);
-                                }
-                              },
                             ),
+                          )
+                        else
+                          Text(
+                            (m['mensaje'] ?? '').toString(),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                            ),
+                          ),
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              _horaEnvio(m['fecha_hora']),
+                              style: const TextStyle(
+                                color: Colors.white60,
+                                fontSize: 10,
+                              ),
+                            ),
+                            if (propio) ...[
+                              const SizedBox(width: 3),
+                              Icon(
+                                leido
+                                    ? Icons.done_all_rounded
+                                    : Icons.done_rounded,
+                                size: 16,
+                                color: leido
+                                    ? const Color(0xFFB3E5FC)
+                                    : Colors.white60,
+                                semanticLabel:
+                                leido ? 'Leído' : 'No leído',
+                              ),
+                            ],
                           ],
                         ),
-                      ),
-                    );
-                  },
-                  child: Align(
-                    alignment: propio
-                        ? Alignment.centerRight
-                        : Alignment.centerLeft,
-                    child: Container(
-                      margin: const EdgeInsets.symmetric(vertical: 4),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 9),
-                      constraints: BoxConstraints(
-                        maxWidth:
-                        MediaQuery.of(context).size.width * 0.72,
-                      ),
-                      decoration: BoxDecoration(
-                        color: propio
-                            ? const Color(0xFF448AFF)
-                            : const Color(0xFF333344),
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: propio
-                            ? CrossAxisAlignment.end
-                            : CrossAxisAlignment.start,
-                        children: [
-                          if (m['es_imagen'] == true)
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.network(
-                                '$kBaseUrl${m['mensaje']}',
-                                fit: BoxFit.cover,
-                                errorBuilder:
-                                    (context, error, stackTrace) =>
-                                const Icon(
-                                  Icons.broken_image,
-                                  color: Colors.white54,
-                                ),
-                              ),
-                            )
-                          else
-                            Text(
-                              (m['mensaje'] ?? '').toString(),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 15,
-                              ),
-                            ),
-                          const SizedBox(height: 4),
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                _horaEnvio(m['fecha_hora']),
-                                style: const TextStyle(
-                                  color: Colors.white60,
-                                  fontSize: 10,
-                                ),
-                              ),
-                              if (propio) ...[
-                                const SizedBox(width: 3),
-                                Icon(
-                                  leido
-                                      ? Icons.done_all_rounded
-                                      : Icons.done_rounded,
-                                  size: 16,
-                                  color: leido
-                                      ? const Color(0xFFB3E5FC)
-                                      : Colors.white60,
-                                  semanticLabel:
-                                  leido ? 'Leído' : 'No leído',
-                                ),
-                              ],
-                            ],
-                          ),
-                        ],
-                      ),
+                      ],
                     ),
                   ),
                 );

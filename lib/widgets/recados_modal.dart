@@ -45,8 +45,6 @@ class _RecadosModalState extends State<RecadosModal> {
 
   String get _nombrePlural =>
       widget.mostrarComoMensajes ? 'mensajes' : 'recados';
-  String get _nombreSingular =>
-      widget.mostrarComoMensajes ? 'mensaje' : 'recado';
   String get _tituloModal =>
       widget.mostrarComoMensajes ? 'Mensajes' : 'Recados';
 
@@ -103,11 +101,6 @@ class _RecadosModalState extends State<RecadosModal> {
       case 'POST':
         response = await _client
             .post(uri, headers: headers, body: bodyJson)
-            .timeout(timeout);
-        break;
-      case 'DELETE':
-        response = await _client
-            .delete(uri, headers: headers, body: bodyJson)
             .timeout(timeout);
         break;
       case 'PUT':
@@ -209,34 +202,11 @@ class _RecadosModalState extends State<RecadosModal> {
     }
   }
 
-  Future<void> _accion(Map<String, dynamic> recado,
-      {required bool eliminar}) async {
-    if (_ocupado || _consultando) return;
+  Future<void> _resolver(Map<String, dynamic> recado) async {
+    if (_esAdmin != true || _ocupado || _consultando) return;
     setState(() => _ocupado = true);
     try {
-      if (eliminar) {
-        final confirmar = await showDialog<bool>(
-            context: context,
-            builder: (ctx) => AlertDialog(
-                  title: Text('Cancelar $_nombreSingular'),
-                  content: Text(
-                      '¿Cancelar "${recado['titulo']}"? Esta acción no se puede deshacer.'),
-                  actions: [
-                    TextButton(
-                        onPressed: () => Navigator.pop(ctx, false),
-                        child: const Text('Volver')),
-                    TextButton(
-                        onPressed: () => Navigator.pop(ctx, true),
-                        child: const Text('Confirmar cancelación')),
-                  ],
-                ));
-        if (confirmar != true || !mounted) return;
-      }
-      if (eliminar) {
-        await _peticion('DELETE', '/recados/${recado['id']}');
-      } else {
-        await _llamarParaResolver(recado);
-      }
+      await _llamarParaResolver(recado);
       if (mounted) await _cargar(silencioso: true);
     } catch (e) {
       if (mounted) setState(() => _error = _mensajeError(e));
@@ -609,8 +579,6 @@ class _RecadosModalState extends State<RecadosModal> {
             'Citófono (${r['device_id'] ?? 'equipo no registrado'})',
           _ => 'No registrado',
         };
-        final propio = _normalizarRut(r['rut_emisor']?.toString() ?? '') ==
-            _normalizarRut(widget.miRut);
         final dia = _dia(fechaGrupo(r));
         final mostrarDia = i == 0 || _dia(fechaGrupo(recados[i - 1])) != dia;
         return Column(
@@ -674,26 +642,19 @@ class _RecadosModalState extends State<RecadosModal> {
                     Text(
                         'Fecha de resolución: ${_fecha(r['fecha_resolucion'])}',
                         style: const TextStyle(color: Colors.white54)),
-                  if ((_esAdmin == true && !resueltos) ||
-                      (_esAdmin == false && propio && !resueltos)) ...[
+                  if (_esAdmin == true && !resueltos) ...[
                     const SizedBox(height: 16),
                     SizedBox(
                         width: double.infinity,
                         child: ElevatedButton.icon(
                           onPressed: _ocupado || _consultando
                               ? null
-                              : () => _accion(r, eliminar: _esAdmin == false),
+                              : () => _resolver(r),
                           style: ElevatedButton.styleFrom(
-                              backgroundColor: _esAdmin == true
-                                  ? const Color(0xFF4CAF50)
-                                  : Colors.red.shade700,
+                              backgroundColor: const Color(0xFF4CAF50),
                               foregroundColor: Colors.white),
-                          icon: Icon(_esAdmin == true
-                              ? Icons.call
-                              : Icons.delete_outline),
-                          label: Text(_esAdmin == true
-                              ? 'Llamar para resolver'
-                              : 'Cancelar $_nombreSingular'),
+                          icon: const Icon(Icons.call),
+                          label: const Text('Llamar para resolver'),
                         )),
                   ],
                 ],
@@ -730,7 +691,7 @@ class _RecadosModalState extends State<RecadosModal> {
                     Expanded(
                         child: Text(
                             _esAdmin == false
-                                ? 'Mis $_nombrePlural'
+                                ? 'Mensajes'
                                 : _tituloModal,
                             style: const TextStyle(
                                 color: Colors.white,
@@ -752,7 +713,7 @@ class _RecadosModalState extends State<RecadosModal> {
                         child: ElevatedButton.icon(
                             onPressed: _ocupado || _consultando ? null : _crear,
                             icon: const Icon(Icons.add),
-                            label: const Text('Crear recado'))),
+                            label: const Text('Crear Mensaje Pendiente'))),
                   const TabBar(
                       labelColor: Color(0xFF20CDFF),
                       unselectedLabelColor: Colors.white54,
@@ -859,7 +820,7 @@ class _NuevoRecadoDialogState extends State<_NuevoRecadoDialog> {
     return PopScope(
         canPop: !_guardando,
         child: AlertDialog(
-          title: const Text('Crear recado'),
+          title: const Text('Crear Mensaje Pendiente'),
           content: SingleChildScrollView(
               child: Form(
                   key: _form,

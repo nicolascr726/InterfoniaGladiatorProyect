@@ -513,6 +513,7 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
         miRut: miRut,
         rutosOcupados: rutosOcupados,
         onLlamar: _llamar,
+        mostrarCitofonos: false,
       ),
     );
   }
@@ -624,7 +625,7 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
                           Icon(Icons.apartment_rounded, color: Color(0xFF6366F1), size: 28),
                           SizedBox(width: 10),
                           Text(
-                            'Gladiator Interfonia',
+                            'Interfonia Gladiator',
                             style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
                           ),
                         ],
@@ -755,7 +756,7 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
                               ),
                             ),
                             icon: const Icon(Icons.sticky_note_2_rounded),
-                            label: const Text('Recados'),
+                            label: const Text('Mensajes Pendientes'),
                           ),
                         ),
                         const SizedBox(height: 14),
