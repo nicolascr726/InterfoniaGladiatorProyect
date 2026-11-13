@@ -27,6 +27,7 @@ class RecadosModal extends StatefulWidget {
 }
 
 class _RecadosModalState extends State<RecadosModal> {
+  static const _limiteDescripcion = 80;
   late final http.Client _client;
   Timer? _timer;
   List<Map<String, dynamic>> _recados = [];
@@ -40,6 +41,7 @@ class _RecadosModalState extends State<RecadosModal> {
   _IntentoRecado? _intentoLlamada;
   final _busquedaPendientes = TextEditingController();
   final _busquedaResueltos = TextEditingController();
+  final _recadosExpandidos = <String>{};
   FiltroFechaHora _filtroPendientes = const FiltroFechaHora();
   FiltroFechaHora _filtroResueltos = const FiltroFechaHora();
 
@@ -346,6 +348,53 @@ class _RecadosModalState extends State<RecadosModal> {
     return '${dos(fecha.day)}/${dos(fecha.month)}/${fecha.year} ${dos(fecha.hour)}:${dos(fecha.minute)}';
   }
 
+  String _hora(dynamic valor) {
+    final fecha = _fechaLocal(valor);
+    if (fecha == null) return 'Hora no registrada';
+    return '${fecha.hour.toString().padLeft(2, '0')}:${fecha.minute.toString().padLeft(2, '0')}';
+  }
+
+  Widget _descripcionRecado(String descripcion, {required bool expandido}) {
+    const estilo = TextStyle(color: Colors.white70, height: 1.4);
+    if (expandido) return Text(descripcion, style: estilo);
+    return LayoutBuilder(builder: (context, constraints) {
+      final texto = descripcion.replaceAll(RegExp(r'\s+'), ' ').trim();
+      final caracteres = texto.characters.toList();
+      final painter = TextPainter(
+        textDirection: Directionality.of(context),
+        textScaler: MediaQuery.textScalerOf(context),
+        maxLines: 1,
+      );
+      bool cabe(String valor) {
+        painter.text = TextSpan(
+          text: valor,
+          style: DefaultTextStyle.of(context).style.merge(estilo),
+        );
+        painter.layout(maxWidth: constraints.maxWidth);
+        return !painter.didExceedMaxLines;
+      }
+
+      var resumen = texto;
+      if (caracteres.length > _limiteDescripcion || !cabe(texto)) {
+        var inicio = 0;
+        var fin = caracteres.length < _limiteDescripcion - 3
+            ? caracteres.length
+            : _limiteDescripcion - 3;
+        while (inicio < fin) {
+          final medio = (inicio + fin + 1) ~/ 2;
+          if (cabe('${caracteres.take(medio).join()}...')) {
+            inicio = medio;
+          } else {
+            fin = medio - 1;
+          }
+        }
+        resumen = '${caracteres.take(inicio).join().trimRight()}...';
+      }
+      painter.dispose();
+      return Text(resumen, maxLines: 1, softWrap: false, style: estilo);
+    });
+  }
+
   String _normalizarBusqueda(String valor) => valor
       .toLowerCase()
       .trim()
@@ -579,6 +628,15 @@ class _RecadosModalState extends State<RecadosModal> {
             'Citófono (${r['device_id'] ?? 'equipo no registrado'})',
           _ => 'No registrado',
         };
+        final identificadorOrigen = switch (origen) {
+          'app' => 'A',
+          'citofono' => 'C',
+          _ => '?',
+        };
+        final claveRecado = 'recado_${r['id']}_$estado';
+        final expandido = _recadosExpandidos.contains(claveRecado);
+        final titulo = r['titulo']?.toString() ?? '';
+        final descripcion = r['descripcion']?.toString() ?? '';
         final dia = _dia(fechaGrupo(r));
         final mostrarDia = i == 0 || _dia(fechaGrupo(recados[i - 1])) != dia;
         return Column(
@@ -606,7 +664,15 @@ class _RecadosModalState extends State<RecadosModal> {
                   border: Border.all(color: Colors.white12)),
               clipBehavior: Clip.antiAlias,
               child: ExpansionTile(
-                key: PageStorageKey('recado_${r['id']}_$estado'),
+                key: PageStorageKey(claveRecado),
+                initiallyExpanded: expandido,
+                onExpansionChanged: (valor) => setState(() {
+                  if (valor) {
+                    _recadosExpandidos.add(claveRecado);
+                  } else {
+                    _recadosExpandidos.remove(claveRecado);
+                  }
+                }),
                 tilePadding: const EdgeInsets.all(16),
                 childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
                 expandedCrossAxisAlignment: CrossAxisAlignment.start,
@@ -617,19 +683,51 @@ class _RecadosModalState extends State<RecadosModal> {
                 leading: Icon(
                     resueltos ? Icons.check_circle_outline : Icons.schedule,
                     color: color),
-                title: Text(r['titulo'].toString(),
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600)),
-                subtitle: Text(
-                    'Departamento ${r['id_dpto']}\nRUT del emisor: $rutVisible',
-                    style: const TextStyle(color: Colors.white70)),
+                title: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Dpto ${r['id_dpto']} / ${_hora(r['fecha_creacion'])}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: Colors.white70, fontSize: 13),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Tooltip(
+                          message: 'Origen: $origenVisible',
+                          child: Text(identificadorOrigen,
+                              style: TextStyle(
+                                  color: color,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      expandido
+                          ? titulo
+                          : titulo.replaceAll(RegExp(r'\s+'), ' ').trim(),
+                      maxLines: expandido ? null : 1,
+                      overflow: expandido ? null : TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 4),
+                    _descripcionRecado(descripcion, expandido: expandido),
+                  ],
+                ),
                 children: [
-                  Text(r['descripcion'].toString(),
-                      style:
-                          const TextStyle(color: Colors.white70, height: 1.4)),
-                  const SizedBox(height: 14),
+                  Text('RUT del emisor: $rutVisible',
+                      style: const TextStyle(color: Colors.white70)),
+                  const SizedBox(height: 6),
                   Text('Estado: ${resueltos ? 'Resuelto' : 'Pendiente'}',
                       style: TextStyle(color: color)),
                   const SizedBox(height: 6),
@@ -690,9 +788,7 @@ class _RecadosModalState extends State<RecadosModal> {
                   Row(children: [
                     Expanded(
                         child: Text(
-                            _esAdmin == false
-                                ? 'Mensajes'
-                                : _tituloModal,
+                            _esAdmin == false ? 'Mensajes' : _tituloModal,
                             style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 20,

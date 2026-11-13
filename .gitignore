@@ -44,10 +44,15 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 *.apk
+# Claves y contraseñas de firma Android (solo configuración local).
+/android/key.properties
+*.jks
+*.keystore
 .aider*
 
 # Configuración privada de correo (incluye contraseña de aplicación).
 /correo_config.json
 /correo_config.json.*
 *.py
-/test
+/test/*
+test/recados_modal_test.dart

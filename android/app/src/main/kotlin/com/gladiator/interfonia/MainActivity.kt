@@ -1,4 +1,4 @@
-package com.example.citofono
+package com.gladiator.interfonia
 
 import android.content.BroadcastReceiver
 import android.content.Context

@@ -51,7 +51,7 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions android = FirebaseOptions(
     apiKey: 'AIzaSyDehd4UjVyuWnfAklqQdwnKFfOmLSXP2h4',
-    appId: '1:297733501497:android:1a108e5cf5d390bc7953e8',
+    appId: '1:297733501497:android:03206cccf81f7adb7953e8',
     messagingSenderId: '297733501497',
     projectId: 'citofono-e2a73',
     storageBucket: 'citofono-e2a73.firebasestorage.app',
