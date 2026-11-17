@@ -31,7 +31,8 @@ import '../services/emergency_service.dart';
 enum _OpcionMenuConserje { directorio, mensajes, puertas, horarios }
 
 class ConserjeScreen extends StatefulWidget {
-  const ConserjeScreen({super.key});
+  final http.Client? emergencyClient;
+  const ConserjeScreen({super.key, this.emergencyClient});
 
   @override
   State<ConserjeScreen> createState() => _ConserjeScreenState();
@@ -353,6 +354,11 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       unawaited(_recibirRegistroNotificacion(Map<String, dynamic>.from(data)));
     });
 
+    socket.on('emergency-state', (data) {
+      if (!mounted || _cerrandoSesion || miRut.isEmpty) return;
+      unawaited(NotificationHistoryService.recordEmergencyActivation(miRut, data));
+    });
+
     socket.on('incoming-call', (data) {
       if (!mounted) return;
       if (data is Map && data['caller_rut'] == miRut) return;
@@ -494,7 +500,8 @@ class _ConserjeScreenState extends State<ConserjeScreen>
               miRut: miRut,
               rutDestino: payload['caller_rut']?.toString() ?? '',
               callId: payload['call_id']?.toString(),
-              initialSpeakerOn: decision != IncomingCallDecision.acceptWithHandset,
+              initialSpeakerOn: false,
+              initialHandsetLifted: decision == IncomingCallDecision.acceptWithHandset,
             )
           : LlamadaScreen(
               room: payload['caller_rut']?.toString() ?? '',
@@ -550,7 +557,10 @@ class _ConserjeScreenState extends State<ConserjeScreen>
     } catch (_) {}
   }
 
-  Future<void> _llamar(String rut, String tipo) async {
+  Future<void> _llamarCitofonoDesdeHistorial(String deviceId) =>
+      _llamar('CITOFONO', 'audio', deviceId: deviceId);
+
+  Future<void> _llamar(String rut, String tipo, {String? deviceId}) async {
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -575,6 +585,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
           'tipo': tipo,
           'caller_rut': miRut,
           'caller_dpto': 'Conserjería',
+          if (deviceId != null) 'device_id': deviceId,
         }),
       ).timeout(const Duration(seconds: 10));
 
@@ -803,7 +814,11 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       case 'video':
       case 'video_call':
       case 'missed_call':
-        destino = HistorialModal(miRut: miRut);
+        destino = HistorialModal(
+          miRut: miRut,
+          onLlamar: _llamar,
+          onLlamarCitofono: _llamarCitofonoDesdeHistorial,
+        );
         break;
       case 'recado':
       case 'recado_created':
@@ -850,7 +865,11 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => ReportesModal(miRut: miRut),
+      builder: (_) => ReportesModal(
+        miRut: miRut,
+        onLlamar: _llamar,
+        onLlamarCitofono: _llamarCitofonoDesdeHistorial,
+      ),
     );
   }
 
@@ -865,7 +884,8 @@ class _ConserjeScreenState extends State<ConserjeScreen>
 
     String resultado;
     try {
-      final response = await http.post(
+      final post = widget.emergencyClient?.post ?? http.post;
+      final response = await post(
         Uri.parse('$kBaseUrl/api/esp32/aviso-emergencia'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
@@ -894,6 +914,16 @@ class _ConserjeScreenState extends State<ConserjeScreen>
           throw const FormatException('Estado de emergencia no válido.');
         }
         EmergencyService.instance.applyServerState(emergencia);
+        await NotificationHistoryService.recordEmergencyActivation(
+          rutEnvio,
+          emergencia,
+          senderLabel: miNombre,
+        );
+        if (!mounted || _cerrandoSesion || miRut != rutEnvio ||
+            !identical(socket, socketEnvio)) {
+          return;
+        }
+        await _cargarNotificaciones();
         final total = data['total'];
         final enviados = data['enviados'];
         final fallidos = data['fallidos'];
@@ -951,6 +981,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
 
   @override
   void dispose() {
+    _cerrandoSesion = true;
     _llamadaEntrante?.dispose();
     _llamadaEntrante = null;
     WidgetsBinding.instance.removeObserver(this);

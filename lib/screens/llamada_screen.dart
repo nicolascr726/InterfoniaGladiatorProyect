@@ -51,7 +51,7 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
         '${segundos.toString().padLeft(2, '0')}';
   }
 
-  bool _speakerOn = true;
+  bool _speakerOn = false;
   bool _muted = false;
 
   void _toggleSpeaker() async {
@@ -225,9 +225,7 @@ class _LlamadaScreenState extends State<LlamadaScreen> {
       });
       if (mounted) setState(() {}); // Renderizar el video local
       
-      if (widget.tipo == 'audio') {
-        Helper.setSpeakerphoneOn(_speakerOn);
-      }
+      await Helper.setSpeakerphoneOn(_speakerOn);
     } catch (e) {
       if (mounted) setState(() => _status = 'Error al acceder a la cámara: $e');
     }

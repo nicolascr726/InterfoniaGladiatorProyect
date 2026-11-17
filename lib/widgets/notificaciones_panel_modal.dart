@@ -95,6 +95,8 @@ class _NotificacionesPanelState extends State<NotificacionesPanel> {
         return Icons.task_alt_rounded;
       case 'door_opening':
         return Icons.door_front_door_outlined;
+      case 'emergency':
+        return Icons.warning_amber_rounded;
       default:
         return Icons.notifications_none_rounded;
     }
@@ -123,6 +125,8 @@ class _NotificacionesPanelState extends State<NotificacionesPanel> {
         return const Color(0xFF81C784);
       case 'door_opening':
         return const Color(0xFFCE93D8);
+      case 'emergency':
+        return const Color(0xFFFF8A80);
       default:
         return const Color(0xFFFFCC80);
     }
@@ -152,7 +156,7 @@ class _NotificacionesPanelState extends State<NotificacionesPanel> {
             ),
             SizedBox(height: 8),
             Text(
-              'Aquí aparecerán las llamadas, mensajes, recados y aperturas de puerta.',
+              'Aquí aparecerán las llamadas, mensajes, recados, alertas y aperturas de puerta.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.white54, fontSize: 14),
             ),
@@ -165,9 +169,7 @@ class _NotificacionesPanelState extends State<NotificacionesPanel> {
   Widget _notificacion(NotificationHistoryEntry notificacion) {
     final color = _color(notificacion.type);
     return InkWell(
-      onTap: widget.onTap == null
-          ? null
-          : () => widget.onTap!(notificacion),
+      onTap: widget.onTap == null ? null : () => widget.onTap!(notificacion),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
         child: Row(

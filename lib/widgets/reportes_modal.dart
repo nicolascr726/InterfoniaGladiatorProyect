@@ -5,8 +5,15 @@ import 'recados_modal.dart';
 
 class ReportesModal extends StatelessWidget {
   final String miRut;
+  final Future<void> Function(String rut, String tipo)? onLlamar;
+  final Future<void> Function(String deviceId)? onLlamarCitofono;
 
-  const ReportesModal({super.key, required this.miRut});
+  const ReportesModal({
+    super.key,
+    required this.miRut,
+    this.onLlamar,
+    this.onLlamarCitofono,
+  });
 
   void _abrirReporte(BuildContext context, WidgetBuilder builder) {
     showModalBottomSheet<void>(
@@ -93,7 +100,11 @@ class ReportesModal extends StatelessWidget {
                 icono: Icons.history_rounded,
                 onTap: () => _abrirReporte(
                   context,
-                  (_) => HistorialModal(miRut: miRut),
+                  (_) => HistorialModal(
+                    miRut: miRut,
+                    onLlamar: onLlamar,
+                    onLlamarCitofono: onLlamarCitofono,
+                  ),
                 ),
               ),
               _botonReporte(

@@ -283,7 +283,8 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
               miRut: miRut,
               rutDestino: payload['caller_rut']?.toString() ?? '',
               callId: payload['call_id']?.toString(),
-              initialSpeakerOn: decision != IncomingCallDecision.acceptWithHandset,
+              initialSpeakerOn: false,
+              initialHandsetLifted: decision == IncomingCallDecision.acceptWithHandset,
             )
           : LlamadaScreen(
               room: payload['caller_rut']?.toString() ?? '',

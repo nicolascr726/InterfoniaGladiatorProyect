@@ -502,6 +502,40 @@ class NotificationHistoryService {
     }
   }
 
+  /// Guarda la activación confirmada por HTTP o Socket sin esperar al inbox.
+  /// Comparte el ID del servidor; su evento completo conserva la prioridad.
+  static Future<void> recordEmergencyActivation(
+    String rut,
+    dynamic payload, {
+    String? senderLabel,
+  }) async {
+    if (payload is! Map ||
+        payload['active'] != true ||
+        payload['id'] is! String ||
+        payload['message'] is! String ||
+        payload['started_at'] is! String) {
+      return;
+    }
+    final id = _text(payload['id']);
+    final message = _text(payload['message']);
+    final startedAt = _eventDate(payload['started_at'] as String);
+    if (id.isEmpty || message.isEmpty || startedAt == null) return;
+    final normalizedRut = _rut(rut);
+    if (!await _isCurrentAccount(normalizedRut, _sessionGeneration)) return;
+    final sender = _text(senderLabel);
+    await recordEvent(
+      rut: normalizedRut,
+      type: 'emergency',
+      data: {
+        'event_id': 'emergency:$id',
+        'fecha_hora': startedAt.toIso8601String(),
+      },
+      title: 'Alerta de emergencia',
+      body: sender.isEmpty ? message : '$sender · $message',
+      source: 'emergency_activation',
+    );
+  }
+
   static Future<void> recordEvent({
     required String rut,
     required String type,

@@ -19,6 +19,7 @@ class CitofonoAudioScreen extends StatefulWidget {
   final IO.Socket? socket;
   final String? callId;
   final bool initialSpeakerOn;
+  final bool initialHandsetLifted;
 
   const CitofonoAudioScreen({
     super.key,
@@ -28,7 +29,8 @@ class CitofonoAudioScreen extends StatefulWidget {
     required this.isCaller,
     this.socket,
     this.callId,
-    this.initialSpeakerOn = true,
+    this.initialSpeakerOn = false,
+    this.initialHandsetLifted = false,
   });
 
   @override
@@ -52,7 +54,7 @@ class _CitofonoAudioScreenState extends State<CitofonoAudioScreen> {
   bool _audioStarted = false;
   bool _answered = false;
   bool _muted = false;
-  bool _speakerOn = true;
+  bool _speakerOn = false;
   bool _physicalHandsetWasLifted = false;
   int? _lastHookSequence;
   bool _checkingHandset = false;
@@ -69,7 +71,7 @@ class _CitofonoAudioScreenState extends State<CitofonoAudioScreen> {
     super.initState();
     _callId = widget.callId;
     _speakerOn = widget.initialSpeakerOn;
-    _physicalHandsetWasLifted = !widget.initialSpeakerOn;
+    _physicalHandsetWasLifted = widget.initialHandsetLifted;
     _setupSocket();
     _startHandsetMonitor();
     _cargarNombreCitofono();
@@ -325,7 +327,6 @@ class _CitofonoAudioScreenState extends State<CitofonoAudioScreen> {
       await _bridge.setUseSpeaker(_speakerOn);
       await _bridge.start();
       _bridge.setMuted(_muted);
-      await _bridge.setUseSpeaker(_speakerOn);
       
       if (Platform.isIOS) {
         try {
@@ -335,6 +336,8 @@ class _CitofonoAudioScreenState extends State<CitofonoAudioScreen> {
           debugPrint('[CITOFONO_IOS] Fallo al iniciar el motor AVAudioEngine: $e');
         }
       }
+
+      await _bridge.setUseSpeaker(_speakerOn);
 
       if (!mounted) return;
 

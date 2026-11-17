@@ -5,11 +5,36 @@ import '../config.dart';
 import '../services/historial_excel_service.dart';
 import '../services/envios_excel_service.dart';
 import '../helpers/filtro_fecha_hora.dart';
+import '../helpers/citofono_call_utils.dart';
+
+class _ContactoHistorial {
+  final String destino;
+  final String nombre;
+  final String participante;
+  final bool esCitofono;
+
+  const _ContactoHistorial({
+    required this.destino,
+    required this.nombre,
+    required this.participante,
+    this.esCitofono = false,
+  });
+
+  String get detalle => esCitofono ? 'Equipo $destino' : 'RUT $destino';
+}
 
 class HistorialModal extends StatefulWidget {
   final String miRut;
   final http.Client? client;
-  const HistorialModal({super.key, required this.miRut, this.client});
+  final Future<void> Function(String rut, String tipo)? onLlamar;
+  final Future<void> Function(String deviceId)? onLlamarCitofono;
+  const HistorialModal({
+    super.key,
+    required this.miRut,
+    this.client,
+    this.onLlamar,
+    this.onLlamarCitofono,
+  });
 
   @override
   State<HistorialModal> createState() => _HistorialModalState();
@@ -223,19 +248,21 @@ class _HistorialModalState extends State<HistorialModal> {
       miRut: widget.miRut,
       nombresPorRut: _nombresPorRut,
     );
-    final emisorCitofono = _esCitofono(llamada['rut_emisor']) ||
-        _esNombreCitofono(participantes.emisor);
-    final receptorCitofono = _esCitofono(llamada['rut_receptor']) ||
-        _esNombreCitofono(participantes.receptor);
+    final citofonos = _participantesCitofono(llamada, participantes);
+    final emisorCitofono = citofonos.contains('emisor');
+    final receptorCitofono = citofonos.contains('receptor');
 
     String resolver(
         String campoRut, String campoNombre, String nombre, bool esCitofono) {
       final rut = _texto(llamada[campoRut]);
-      // Preferir la identidad conservada en el registro, si está disponible.
+      // Preferir la identidad que entrega la API, si está disponible.
       final identidad = llamada['citofono'];
+      final participante = campoRut == 'rut_emisor' ? 'emisor' : 'receptor';
       if (esCitofono &&
           identidad is Map &&
-          emisorCitofono != receptorCitofono) {
+          (_texto(identidad['participante']) == participante ||
+              (emisorCitofono != receptorCitofono &&
+                  _texto(identidad['participante']).isEmpty))) {
         return _nombreCitofono(identidad);
       }
       if (RegExp(r'^cit[oó]fono de\s+', caseSensitive: false)
@@ -307,6 +334,192 @@ class _HistorialModalState extends State<HistorialModal> {
     } finally {
       if (mounted) setState(() => _exportando = false);
     }
+  }
+
+  Set<String> _participantesCitofono(
+    Map<String, dynamic> llamada,
+    ({String emisor, String receptor}) participantes,
+  ) {
+    final tipo = _texto(llamada['tipo_llamada']).toLowerCase();
+    if (tipo == 'citofono_emisor') return {'emisor'};
+    if (tipo == 'citofono_receptor') return {'receptor'};
+
+    final citofonos = <String>{};
+    for (final participante in ['emisor', 'receptor']) {
+      final rut = _normalizarIdentificador(llamada['rut_$participante']);
+      final nombre = participante == 'emisor'
+          ? participantes.emisor
+          : participantes.receptor;
+      if (isCitofonoTarget(rut) ||
+          _esNombreCitofono(nombre) ||
+          (!RegExp(r'^[0-9]+K?$').hasMatch(rut) &&
+              _dispositivoPorIdentificador(rut) != null)) {
+        citofonos.add(participante);
+      }
+    }
+    final identidad = llamada['citofono'];
+    if (identidad is Map) {
+      final participante = _texto(identidad['participante']);
+      if (participante == 'emisor' || participante == 'receptor') {
+        citofonos.add(participante);
+      } else if (citofonos.isEmpty) {
+        final propietario = _normalizarIdentificador(identidad['rut_usuario']);
+        final coincidencias = ['emisor', 'receptor']
+            .where((parte) =>
+                propietario.isNotEmpty &&
+                _normalizarIdentificador(llamada['rut_$parte']) == propietario)
+            .toList();
+        if (coincidencias.length == 1) citofonos.add(coincidencias.single);
+      }
+    }
+    return citofonos;
+  }
+
+  Map<String, dynamic>? _dispositivoPorIdentificador(String identificador) {
+    if (identificador.isEmpty ||
+        const ['CITOFONO', '99999999'].contains(identificador)) {
+      return null;
+    }
+    final coincidencias = _citofonosPorId.values
+        .where((dispositivo) =>
+            _normalizarIdentificador(dispositivo['device_id']) == identificador)
+        .toList();
+    return coincidencias.length == 1 ? coincidencias.single : null;
+  }
+
+  String? _dispositivoDelHistorial(Map<String, dynamic> llamada,
+      String participante, Set<String> participantesCitofono) {
+    final identidad = llamada['citofono'];
+    final identidadCorresponde = identidad is Map &&
+        (_texto(identidad['participante']) == participante ||
+            (_texto(identidad['participante']).isEmpty &&
+                participantesCitofono.length == 1));
+    if (identidadCorresponde) {
+      final deviceId = _texto(identidad['device_id']);
+      if (deviceId.isNotEmpty) {
+        return RegExp(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$').hasMatch(deviceId)
+            ? deviceId
+            : null;
+      }
+    }
+    final rut = _normalizarIdentificador(llamada['rut_$participante']);
+    final dispositivo = _dispositivoPorIdentificador(rut);
+    if (dispositivo != null) return _texto(dispositivo['device_id']);
+
+    // El historial identifica al propietario, sin almacenar la placa.
+    // Resolverlo requiere una única asociación actual; CITOFONO nunca basta.
+    final propietarioIdentidad = identidadCorresponde
+        ? _normalizarIdentificador(identidad['rut_usuario'])
+        : '';
+    final propietario =
+        propietarioIdentidad.isNotEmpty ? propietarioIdentidad : rut;
+    if (propietario.isEmpty ||
+        isCitofonoTarget(propietario) ||
+        !RegExp(r'^[0-9]+K?$').hasMatch(propietario)) {
+      return null;
+    }
+    final dispositivos = _citofonosPorId.values
+        .where((dispositivo) =>
+            _normalizarIdentificador(dispositivo['rut_usuario']) == propietario)
+        .map((dispositivo) => _texto(dispositivo['device_id']))
+        .toSet();
+    return dispositivos.length == 1 ? dispositivos.single : null;
+  }
+
+  List<_ContactoHistorial> _contactosLlamables(
+    Map<String, dynamic> llamada,
+    ({String emisor, String receptor}) participantes,
+  ) {
+    final contactos = <_ContactoHistorial>[];
+    final citofonos = _participantesCitofono(llamada, participantes);
+    for (final participante in ['emisor', 'receptor']) {
+      final nombre = participante == 'emisor'
+          ? participantes.emisor
+          : participantes.receptor;
+      if (citofonos.contains(participante)) {
+        final deviceId =
+            _dispositivoDelHistorial(llamada, participante, citofonos);
+        if (widget.onLlamarCitofono != null &&
+            deviceId != null &&
+            !contactos.any((contacto) =>
+                contacto.esCitofono && contacto.destino == deviceId)) {
+          contactos.add(_ContactoHistorial(
+            destino: deviceId,
+            nombre: nombre,
+            participante: participante,
+            esCitofono: true,
+          ));
+        }
+        continue;
+      }
+      final rut = _normalizarIdentificador(llamada['rut_$participante']);
+      if (widget.onLlamar == null ||
+          rut.isEmpty ||
+          rut == _normalizarIdentificador(widget.miRut) ||
+          isCitofonoTarget(rut) ||
+          !RegExp(r'^[0-9]+K?$').hasMatch(rut) ||
+          contactos.any(
+              (contacto) => !contacto.esCitofono && contacto.destino == rut)) {
+        continue;
+      }
+      contactos.add(_ContactoHistorial(
+        destino: rut,
+        nombre: nombre,
+        participante: participante,
+      ));
+    }
+    return contactos;
+  }
+
+  Future<void> _llamarAlContacto(_ContactoHistorial contacto) async {
+    final Future<void> Function() iniciarLlamada;
+    if (contacto.esCitofono) {
+      final onLlamarCitofono = widget.onLlamarCitofono;
+      if (onLlamarCitofono == null) return;
+      iniciarLlamada = () => onLlamarCitofono(contacto.destino);
+    } else {
+      final onLlamar = widget.onLlamar;
+      if (onLlamar == null ||
+          contacto.destino == _normalizarIdentificador(widget.miRut)) {
+        return;
+      }
+      iniciarLlamada = () => onLlamar(contacto.destino, 'audio');
+    }
+    Navigator.pop(context);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    await iniciarLlamada();
+  }
+
+  Widget _botonLlamar(List<_ContactoHistorial> contactos) {
+    if (contactos.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    if (contactos.length == 1) {
+      final contacto = contactos.single;
+      return IconButton(
+        tooltip: 'Llamar a ${contacto.nombre} (${contacto.detalle})',
+        icon: const Icon(Icons.call, color: Color(0xFF4CAF50)),
+        onPressed: () => _llamarAlContacto(contacto),
+      );
+    }
+    return PopupMenuButton<_ContactoHistorial>(
+      tooltip: 'Elegir contacto para llamar',
+      icon: const Icon(Icons.call, color: Color(0xFF4CAF50)),
+      color: const Color(0xFF222233),
+      onSelected: _llamarAlContacto,
+      itemBuilder: (_) => [
+        for (final contacto in contactos)
+          PopupMenuItem(
+            value: contacto,
+            child: Text(
+              'Llamar a ${contacto.nombre}\n'
+              '${contacto.participante == 'emisor' ? 'Emisor' : 'Receptor'} · '
+              '${contacto.detalle}',
+              style: const TextStyle(color: Colors.white),
+            ),
+          ),
+      ],
+    );
   }
 
   Color _colorEstado(String estado) {
@@ -479,6 +692,8 @@ class _HistorialModalState extends State<HistorialModal> {
                             final mostrarDia = i == 0 ||
                                 _dia(historial[i - 1]['fecha']) != dia;
                             final participantes = _resolverParticipantes(l);
+                            final contactos =
+                                _contactosLlamables(l, participantes);
                             final tipo = (l['tipo'] ?? 'Llamada').toString();
                             final fecha =
                                 HistorialExcelService.formatearFechaLocal(
@@ -564,6 +779,7 @@ class _HistorialModalState extends State<HistorialModal> {
                                       ],
                                     ),
                                   ),
+                                  _botonLlamar(contactos),
                                 ],
                               ),
                             );

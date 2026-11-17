@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_sound/flutter_sound.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' show Helper;
 import 'package:permission_handler/permission_handler.dart';
 
 import '../config.dart';
@@ -97,7 +98,7 @@ class Esp32AudioBridge {
   bool _recorderStarted = false;
   bool _recorderFailed = false;
   bool _muted = false;
-  bool _useSpeaker = true;
+  bool _useSpeaker = false;
   int _playbackSampleRate = sampleRate;
   String? _playerError;
   String? _recorderError;
@@ -128,9 +129,13 @@ class Esp32AudioBridge {
   }
 
   Future<bool> _applyAudioRoute() async {
-    if (!Platform.isAndroid) return true;
+    if (!Platform.isAndroid && !Platform.isIOS) return true;
 
     try {
+      if (Platform.isIOS) {
+        await Helper.setSpeakerphoneOn(_useSpeaker);
+        return true;
+      }
       final routeInfo = await _nativeAudioTrack.invokeMapMethod<String, dynamic>(
         'setRoute',
         <String, dynamic>{'speakerOn': _useSpeaker},
