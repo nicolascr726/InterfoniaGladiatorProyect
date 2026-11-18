@@ -18,8 +18,10 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#define ARDUINOJSON_USE_LONG_LONG 1
 #include <ArduinoJson.h>
 #include <time.h>
+#include <sys/time.h>
 
 #define RXD2 16
 #define TXD2 17
@@ -34,6 +36,8 @@ const char* RFID_VALIDAR_URL =
     "https://video.gladiatorcontrolbase.com/api/rfid/validar";
 
 const int PUERTA = 3;
+// El backend obtiene el departamento actual de este usuario, nunca de la tarjeta.
+const char* RUT_PROPIETARIO_PUERTA = "11111111";
 const unsigned long TIEMPO_APERTURA_MS = 5000;
 const unsigned long REINTENTO_WIFI_MS = 10000;
 const unsigned long FIN_LECTURA_MS = 50;
@@ -51,6 +55,15 @@ bool releActivo = false;
 bool relojConfigurado = false;
 unsigned long ultimaRecepcion = 0;
 unsigned long aperturaIniciada = 0;
+uint64_t aperturaAutorizadaHastaMs = 0;
+
+void revisarRele();
+
+uint64_t horaEpochMilisegundos() {
+  struct timeval ahora = {};
+  gettimeofday(&ahora, nullptr);
+  return (uint64_t)ahora.tv_sec * 1000ULL + (uint64_t)ahora.tv_usec / 1000ULL;
+}
 unsigned long ultimoReintentoWiFi = 0;
 
 void enviarComandoMP3(byte comando, byte parametro1, byte parametro2) {
@@ -61,7 +74,11 @@ void enviarComandoMP3(byte comando, byte parametro1, byte parametro2) {
   trama[7] = (byte)(checksum >> 8);
   trama[8] = (byte)(checksum & 0xFF);
   SerialMP3.write(trama, sizeof(trama));
-  delay(50);
+  const unsigned long inicioEspera = millis();
+  while (millis() - inicioEspera < 50) {
+    revisarRele();
+    delay(1);
+  }
 }
 
 void denegarAcceso(const String& motivo) {
@@ -80,18 +97,27 @@ void descartarLecturasPendientes() {
 
 void concederAcceso(const String& numeroTarjeta, const char* nombreCompleto,
                     const char* rutUsuario,
-                    const char* departamento, unsigned long validacionMs) {
+                    const char* departamento, unsigned long validacionMs,
+                    uint64_t autorizacionHastaMs) {
+  const uint64_t ahoraMs = horaEpochMilisegundos();
+  if (ahoraMs < 1700000000000ULL || ahoraMs >= autorizacionHastaMs) {
+    denegarAcceso("La autorizacion caduco antes de abrir la puerta.");
+    return;
+  }
+  aperturaAutorizadaHastaMs = autorizacionHastaMs;
   // Abrir en cuanto se valida la respuesta, antes del aviso MP3 y su espera.
   aperturaIniciada = millis();
   releActivo = true;
   digitalWrite(RELAY_PIN, LOW);
-  Serial.printf("[PUERTA 3] Acceso autorizado | Nombre: %s | RUT: %s | Dpto: %s | Tarjeta: %s | Validacion: %lu ms | Apertura: 5 segundos\n",
+  Serial.printf("[PUERTA 3] Acceso autorizado | Nombre: %s | RUT: %s | Dpto: %s | Tarjeta: %s | Validacion: %lu ms | Apertura: hasta 5 segundos\n",
                 nombreCompleto, rutUsuario, departamento, numeroTarjeta.c_str(), validacionMs);
   enviarComandoMP3(0x12, 0x00, 1);
 }
 
 void revisarRele() {
-  if (releActivo && millis() - aperturaIniciada >= TIEMPO_APERTURA_MS) {
+  if (releActivo && (millis() - aperturaIniciada >= TIEMPO_APERTURA_MS ||
+                     horaEpochMilisegundos() < 1700000000000ULL ||
+                     horaEpochMilisegundos() >= aperturaAutorizadaHastaMs)) {
     digitalWrite(RELAY_PIN, HIGH);
     releActivo = false;
     descartarLecturasPendientes();
@@ -160,6 +186,7 @@ void validarYConceder(const String& numeroTarjeta) {
   JsonDocument solicitud;
   solicitud["numero_tarjeta"] = numeroTarjeta;  // Texto: conserva ceros iniciales.
   solicitud["puerta"] = PUERTA;
+  solicitud["rut_propietario_puerta"] = RUT_PROPIETARIO_PUERTA;
   String cuerpo;
   serializeJson(solicitud, cuerpo);
   unsigned long inicioConsulta = millis();
@@ -204,11 +231,20 @@ void validarYConceder(const String& numeroTarjeta) {
     denegarAcceso("La autorizacion no corresponde a la puerta 3.");
     return;
   }
+  if (String(documento["rut_propietario_puerta"] | "") != RUT_PROPIETARIO_PUERTA ||
+      !documento["id_dpto_puerta"].is<const char*>() ||
+      strlen(documento["id_dpto_puerta"].as<const char*>()) == 0 ||
+      !documento["autorizacion_hasta_ms"].is<uint64_t>()) {
+    denegarAcceso("La autorizacion no identifica esta puerta privada.");
+    return;
+  }
+  const uint64_t autorizacionHastaMs = documento["autorizacion_hasta_ms"].as<uint64_t>();
   // Estos datos pertenecen al registro autorizado devuelto por el servidor.
   const char* rutUsuario = documento["registro"]["rut_emisor"] | "No informado";
-  const char* departamento = documento["registro"]["id_dpto"] | "Sin departamento";
+  const char* departamento = documento["id_dpto_puerta"].as<const char*>();
   const char* nombreCompleto = documento["nombre_completo"] | "No informado";
-  concederAcceso(numeroTarjeta, nombreCompleto, rutUsuario, departamento, validacionMs);
+  concederAcceso(numeroTarjeta, nombreCompleto, rutUsuario, departamento,
+                 validacionMs, autorizacionHastaMs);
 }
 
 void finalizarLectura() {

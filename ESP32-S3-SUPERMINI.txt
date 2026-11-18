@@ -1,6 +1,6 @@
 /////////////////////////////////////////////////////////////////
 /*
-  ESP32-S3 + INMP441 + UDA1334A + Botón Físico GPIO 1 + GPIO 2 (Alerta) + Video Backend
+  ESP32-S3 Dev Module / DevKit + INMP441 + UDA1334A + Botón Físico GPIO 1 + GPIO 2 (Alerta) + Video Backend
   Gladiator Control citofono - I2S separado y control concurrente (16/8 kHz)
   + COMANDOS DE PRUEBA LOCAL (TEST_INCOMING, TEST_ACCEPT, etc.)
 */
@@ -19,6 +19,18 @@
 #include <string.h>
 #include <esp_err.h>
 #include <atomic>
+#include <sdkconfig.h>
+#include <esp_arduino_version.h>
+#if !CONFIG_IDF_TARGET_ESP32S3
+#error "Este firmware requiere ESP32-S3; seleccione ESP32S3 Dev Module."
+#endif
+// ESP-SR viene incluido en el paquete de placas esp32 de Espressif 3.3.12.
+#if !__has_include(<esp_aec.h>)
+#error "AEC requiere el paquete esp32 de Espressif Systems 3.3.12 o compatible."
+#endif
+#include <esp_aec.h>
+#include <esp_heap_caps.h>
+#include <esp32-hal-psram.h>
 
 bool initCallControl();
 bool initAudioControl();
@@ -29,37 +41,67 @@ String callIdForStatus();
 void requestAudioPlaybackReset();
 void backendEmergencyTask(void* parameter);
 
-// Micrófono: I2S 0, recepción
+// Perfil inicial ESP32-S3 Dev Module / DevKit. Los numeros son GPIO del chip.
+// Ajustar estos pines al cableado real; no describen posiciones del conector.
+// Evitar pines ocupados por flash/PSRAM y por el USB de la placa.
+// Microfono: I2S 0, recepcion
 #define I2S_MIC_PORT  I2S_NUM_0
+#ifndef I2S_MIC_SD
 #define I2S_MIC_SD    10
+#endif
+#ifndef I2S_MIC_WS
 #define I2S_MIC_WS    11
+#endif
+#ifndef I2S_MIC_SCK
 #define I2S_MIC_SCK   12
+#endif
 
 // DAC del parlante: I2S 1, transmisión
 #define I2S_SPK_PORT  I2S_NUM_1
+#ifndef I2S_SPK_DOUT
 #define I2S_SPK_DOUT  13
+#endif
+#ifndef I2S_SPK_WS
 #define I2S_SPK_WS    7
+#endif
+#ifndef I2S_SPK_SCK
 #define I2S_SPK_SCK   6
+#endif
 
 // 0: micrófono L/R conectado a GND
 // 1: micrófono L/R conectado a 3,3 V
+#ifndef MIC_SLOT_INDEX
 #define MIC_SLOT_INDEX 0
+#endif
 
 // === CONFIGURACIÓN DE AUDIO Y VOLUMEN ===
 #define SPEAKER_GAIN         1.0f    // Base sin amplificación digital; calibrar con el equipo real.
 #define RING_TONE_AMPLITUDE  9000    // Volumen del ring-ring (antes 28000, ajústalo aquí si lo quieres más bajo o alto)
 
-// === BOTONES FÍSICOS Y LED (Ajustados al rango 0-13 de la SuperMini) ===
+// === BOTONES Y LED EXTERNO: GPIO CONFIGURABLES SEGUN EL CABLEADO ===
+#ifndef BUTTON_PIN
 #define BUTTON_PIN     1      // GPIO 1 conectado al botón principal (a GND)
+#endif
+#ifndef BUTTON_PIN_2
 #define BUTTON_PIN_2   2      // GPIO 2 conectado al botón de alerta (a GND)
+#endif
+#ifndef DOOR_BUTTON_1
 #define DOOR_BUTTON_1  4      // GPIO 4 conectado al botón de Apertura Puerta 1 (a GND)
+#endif
+#ifndef DOOR_BUTTON_2
 #define DOOR_BUTTON_2  5      // GPIO 5 conectado al botón de Apertura Puerta 2 (a GND)
-#define LED_NOTICE_PIN 8      // GPIO 8 conectado al LED indicador de aviso (Cambiado de 19 para estar en el rango físico)
+#endif
+#ifndef LED_NOTICE_PIN
+#define LED_NOTICE_PIN 8      // LED externo; el RGB integrado depende de cada placa.
+#endif
 
 // Variables para el control del LED (Enclavado y Parpadeo)
 bool ledEnclavado = false;
 unsigned long lastLedBlinkTime = 0;
 bool ledBlinkState = false;
+// Estado logico del indicador, incluso durante la fase apagada del parpadeo.
+bool ledIndicacionActiva = false;
+bool ledApagadoPendiente = false;
 
 // === CORRECCIÓN DE FRECUENCIAS UNIFICADAS ===
 #define AUDIO_SAMPLE_RATE 16000   // Hardware sincronizado a 16kHz para la APK
@@ -73,8 +115,25 @@ bool ledBlinkState = false;
 #define RX_FRAME_BYTES        (RX_FRAME_SAMPLES * 2)
 #define RX_DAC_SAMPLES        (RX_FRAME_SAMPLES * 2)
 
-#define TX_I2S_SAMPLES        640
+// ESP-SR FD procesa 32 ms a 16 kHz; la red conserva PCM16 mono a 8 kHz.
+#define TX_I2S_SAMPLES        512
+#define AEC_REFERENCE_RING_SAMPLES 4096
+#define AEC_REFERENCE_DELAY_MS     64  // Punto inicial: calibrar el retardo DMA/acustico en placa.
+#define AEC_REFERENCE_DELAY_SAMPLES ((AUDIO_SAMPLE_RATE / 1000) * AEC_REFERENCE_DELAY_MS)
 #define TX_NET_SAMPLES        (TX_I2S_SAMPLES / 2)
+
+// PSRAM se selecciona en Herramientas de Arduino segun el modulo real (QSPI/OPI).
+// AEC_HABILITADO=0 permite arrancar en modo alternado para diagnostico.
+#ifndef AEC_HABILITADO
+#define AEC_HABILITADO 1
+#endif
+#define AEC_MIN_RAM_LIBRE       (96U * 1024U)
+#define AEC_MIN_BLOQUE_RAM      (32U * 1024U)
+#define AEC_MIN_PSRAM_LIBRE     (256U * 1024U)
+#define AEC_MIN_BLOQUE_PSRAM    (128U * 1024U)
+#define AEC_TRAMAS_CALENTAMIENTO 4
+#define MIC_ALTERNADO_UMBRAL    512
+#define MIC_ALTERNADO_RETENCION_MS ((DMA_BUF_COUNT * DMA_BUF_LEN * 1000UL) / AUDIO_SAMPLE_RATE + 160UL)
 
 #define APP_TX_AUDIO_VOLUME_Q8 256   // 1x: evita amplificar diez veces el retorno acústico.
 
@@ -252,6 +311,166 @@ std::atomic<uint32_t> dacPartialWrites{0};
 std::atomic<uint32_t> dacWriteErrors{0};
 std::atomic<uint32_t> dacDroppedFrames{0};
 std::atomic<uint32_t> audioToneQueueDrops{0};
+
+// Solo audioMicTxTask utiliza el algoritmo; el DAC publica la referencia con un mutex.
+static aec_handle_t* echoCanceller = nullptr;
+// El modo queda fijado en setup(), antes de crear las tareas de audio.
+bool audioAecAvailable = false;
+uint8_t aecWarmupFramesRemaining = 0;
+bool micRemoteAudioTailPending = false;
+uint32_t micRemoteAudioMuteUntil = 0;
+alignas(16) static int16_t aecMicFrame[TX_I2S_SAMPLES];
+alignas(16) static int16_t aecRefFrame[TX_I2S_SAMPLES];
+alignas(16) static int16_t aecCleanFrame[TX_I2S_SAMPLES];
+static int16_t aecReferenceRing[AEC_REFERENCE_RING_SAMPLES];
+portMUX_TYPE aecReferenceMux = portMUX_INITIALIZER_UNLOCKED;
+static size_t aecReferenceHead = 0;
+static size_t aecReferenceTail = 0;
+static size_t aecReferenceCount = 0;
+static bool aecReferenceDesynced = false;
+std::atomic<bool> aecCaptureEnabled{false};
+std::atomic<bool> aecResetRequested{false};
+static_assert(AEC_REFERENCE_DELAY_SAMPLES + TX_I2S_SAMPLES < AEC_REFERENCE_RING_SAMPLES,
+              "El retardo AEC excede la capacidad de referencia");
+static_assert(TX_I2S_SAMPLES == TX_NET_SAMPLES * 2, "AEC requiere conversion 16 a 8 kHz");
+
+void resetEchoReference() {
+  portENTER_CRITICAL(&aecReferenceMux);
+  memset(aecReferenceRing, 0, sizeof(aecReferenceRing));
+  aecReferenceHead = AEC_REFERENCE_DELAY_SAMPLES;
+  aecReferenceTail = 0;
+  aecReferenceCount = AEC_REFERENCE_DELAY_SAMPLES;
+  aecReferenceDesynced = false;
+  portEXIT_CRITICAL(&aecReferenceMux);
+}
+
+bool memoriaSuficienteParaAec(size_t internaLibre, size_t bloqueInterno,
+                             size_t externaLibre, size_t bloqueExterno) {
+  return internaLibre >= AEC_MIN_RAM_LIBRE && bloqueInterno >= AEC_MIN_BLOQUE_RAM &&
+      externaLibre >= AEC_MIN_PSRAM_LIBRE && bloqueExterno >= AEC_MIN_BLOQUE_PSRAM;
+}
+
+bool initEchoCancellation() {
+  aecCaptureEnabled.store(false);
+  if (!AEC_HABILITADO) {
+    Serial.println("[AEC] Deshabilitado por configuracion; se utilizara modo alternado.");
+    return false;
+  }
+  if (echoCanceller != nullptr) {
+    aecWarmupFramesRemaining = AEC_TRAMAS_CALENTAMIENTO;
+    resetEchoReference();
+    return true;
+  }
+  const size_t internaLibre = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t bloqueInterno = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t externaLibre = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  const size_t bloqueExterno = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  Serial.printf("[MEM] RAM libre/bloque: %u/%u; PSRAM libre/bloque: %u/%u bytes.\n",
+                (unsigned)internaLibre, (unsigned)bloqueInterno,
+                (unsigned)externaLibre, (unsigned)bloqueExterno);
+  if (!psramFound()) {
+    Serial.println("[AEC] PSRAM no detectada. Revise el modelo y QSPI/OPI; modo alternado.");
+    return false;
+  }
+  if (!memoriaSuficienteParaAec(internaLibre, bloqueInterno, externaLibre, bloqueExterno)) {
+    Serial.println("[AEC] Margen de memoria insuficiente para FD; modo alternado.");
+    return false;
+  }
+  aec_config_t config = {};
+  config.mic_num = 1;
+  config.ref_num = 1;
+  config.out_num = 1;
+  config.filter_length = 4;
+  config.sample_rate = AUDIO_SAMPLE_RATE;
+  // No intentar alojar el modelo FD en la RAM interna de un modulo sin PSRAM.
+  config.caps = MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM;
+  config.mode = AEC_MODE_FD_LOW_COST;
+  config.nlp_level = AEC_NLP_LEVEL_NORMAL;
+  Serial.println("[AEC] Creando modelo FD en PSRAM...");
+  Serial.flush();
+  echoCanceller = aec_create_from_config(&config);
+  if (echoCanceller == nullptr) {
+    Serial.println("[AEC] La biblioteca no pudo reservar memoria; modo alternado.");
+    return false;
+  }
+  if (aec_get_chunksize(echoCanceller) != TX_I2S_SAMPLES) {
+    Serial.println("[AEC] Trama incompatible con ESP-SR; modo alternado.");
+    aec_destroy(echoCanceller);
+    echoCanceller = nullptr;
+    return false;
+  }
+  aecWarmupFramesRemaining = AEC_TRAMAS_CALENTAMIENTO;
+  resetEchoReference();
+  return true;
+}
+
+void publishEchoReference(size_t previousOffset, size_t nextOffset) {
+  if (!aecCaptureEnabled.load()) return;
+  // Publicar solo pares estereo completos, incluso con escrituras parciales.
+  const size_t first = previousOffset / (2 * sizeof(int16_t));
+  const size_t end = nextOffset / (2 * sizeof(int16_t));
+  if (end <= first) return;
+  portENTER_CRITICAL(&aecReferenceMux);
+  if (!aecCaptureEnabled.load() || aecReferenceDesynced) {
+    portEXIT_CRITICAL(&aecReferenceMux);
+    return;
+  }
+  if (end - first > AEC_REFERENCE_RING_SAMPLES - aecReferenceCount) {
+    aecReferenceDesynced = true;
+    portEXIT_CRITICAL(&aecReferenceMux);
+    return;
+  }
+  for (size_t i = first; i < end; i++) {
+    aecReferenceRing[aecReferenceHead] = dacStereoFrame[i * 2];
+    aecReferenceHead = (aecReferenceHead + 1) % AEC_REFERENCE_RING_SAMPLES;
+    aecReferenceCount++;
+  }
+  portEXIT_CRITICAL(&aecReferenceMux);
+}
+
+bool takeEchoReference() {
+  portENTER_CRITICAL(&aecReferenceMux);
+  if (aecReferenceDesynced || aecReferenceCount < TX_I2S_SAMPLES) {
+    portEXIT_CRITICAL(&aecReferenceMux);
+    return false;
+  }
+  for (size_t i = 0; i < TX_I2S_SAMPLES; i++) {
+    aecRefFrame[i] = aecReferenceRing[aecReferenceTail];
+    aecReferenceTail = (aecReferenceTail + 1) % AEC_REFERENCE_RING_SAMPLES;
+    aecReferenceCount--;
+  }
+  portEXIT_CRITICAL(&aecReferenceMux);
+  return true;
+}
+
+void registrarActividadParlante(size_t previousOffset, size_t nextOffset) {
+  if (audioAecAvailable) return;
+  const size_t first = previousOffset / (2 * sizeof(int16_t));
+  const size_t end = nextOffset / (2 * sizeof(int16_t));
+  if (end <= first) return;
+  uint32_t magnitud = 0;
+  for (size_t i = first; i < end; i++) {
+    const int32_t muestra = dacStereoFrame[i * 2];
+    magnitud += muestra < 0 ? -muestra : muestra;
+  }
+  if (magnitud < MIC_ALTERNADO_UMBRAL * (end - first)) return;
+  portENTER_CRITICAL(&audioControlMux);
+  micRemoteAudioMuteUntil = (uint32_t)millis() + MIC_ALTERNADO_RETENCION_MS;
+  micRemoteAudioTailPending = true;
+  portEXIT_CRITICAL(&audioControlMux);
+}
+
+bool micMutedByRemoteAudio() {
+  if (audioAecAvailable) return false;
+  const uint32_t now = (uint32_t)millis();
+  portENTER_CRITICAL(&audioControlMux);
+  if (micRemoteAudioTailPending && (int32_t)(now - micRemoteAudioMuteUntil) >= 0) {
+    micRemoteAudioTailPending = false;
+  }
+  const bool muted = micRemoteAudioTailPending;
+  portEXIT_CRITICAL(&audioControlMux);
+  return muted;
+}
 
 void discardMicBacklog();
 
@@ -1125,8 +1344,21 @@ void rejectIncomingCallOnBackend() {
 void handleRemoteCallEnded(const String &response) {
   const String endedCallId = jsonStringValue(response, "call_id");
   if (currentCallId.length() && endedCallId.length() && endedCallId != currentCallId) return;
+  // El backend registra como perdida la llamada entrante que vence sin respuesta.
+  const bool llamadaPerdida = endedCallId.length() && endedCallId == currentCallId &&
+      jsonStringValue(response, "direction") == "app_to_citofono" &&
+      jsonStringValue(response, "state") == "ended" &&
+      jsonStringValue(response, "end_reason") == "timeout" &&
+      !jsonStringValue(response, "answered_at").length();
   Serial.println("[CALL] Backend confirma fin remoto.");
   stopLocalCall(false);
+  if (llamadaPerdida) {
+    // El loop conserva el aviso hasta su apagado manual, sin repetir el timbre.
+    portENTER_CRITICAL(&avisoMux);
+    avisoLedPendiente = true;
+    portEXIT_CRITICAL(&avisoMux);
+    Serial.println("[LED] Llamada perdida: indicador enclavado.");
+  }
 }
 
 void pollBackendCallState() {
@@ -1262,7 +1494,10 @@ bool writePendingDacFrame(size_t& offset) {
     dacWriteErrors++;
     return false;
   }
+  const size_t previousOffset = offset;
   offset += written;
+  registrarActividadParlante(previousOffset, offset);
+  publishEchoReference(previousOffset, offset);
   dacWrittenBytes += written;
   if (result != ESP_OK || written == 0) dacWriteErrors++;
   if (offset != sizeof(dacStereoFrame)) dacPartialWrites++;
@@ -1305,6 +1540,8 @@ void audioPlaybackTask(void* parameter) {
       pendingLocalTone = false;
       ringClear();
       i2s_zero_dma_buffer(I2S_SPK_PORT);
+      aecCaptureEnabled.store(false);
+      aecResetRequested.store(true);
       primed = false;
       emergenciaSonando = reproducirEmergencia;
       generacionReproducida = generacion;
@@ -1401,49 +1638,104 @@ int16_t amplifyAudioForApp(int32_t sample) {
   return (int16_t)sample;
 }
 
+bool cancelMicEcho() {
+  if (echoCanceller == nullptr || !takeEchoReference()) {
+    // No transmitir voz sin cancelar cuando la referencia esta incompleta.
+    memset(micTxMonoFrame, 0, sizeof(micTxMonoFrame));
+    aecCaptureEnabled.store(false);
+    aecResetRequested.store(true);
+    return false;
+  }
+  for (int i = 0; i < TX_I2S_SAMPLES; i++) {
+    aecMicFrame[i] = (int16_t)(i2sTxStereoFrame[i * 2 + MIC_SLOT_INDEX] >> 16);
+  }
+  aec_process(echoCanceller, aecMicFrame, aecRefFrame, aecCleanFrame);
+  if (aecWarmupFramesRemaining > 0) {
+    aecWarmupFramesRemaining--;
+    memset(micTxMonoFrame, 0, sizeof(micTxMonoFrame));
+    return true;
+  }
+  for (int i = 0; i < TX_NET_SAMPLES; i++) {
+    const int32_t mixed = ((int32_t)aecCleanFrame[i * 2] + aecCleanFrame[i * 2 + 1]) / 2;
+    micTxMonoFrame[i] = amplifyAudioForApp(mixed);
+  }
+  return true;
+}
+
+void convertirMicSinAec(bool suprimir) {
+  if (suprimir) {
+    memset(micTxMonoFrame, 0, sizeof(micTxMonoFrame));
+    return;
+  }
+  for (int i = 0; i < TX_NET_SAMPLES; i++) {
+    const int32_t a = i2sTxStereoFrame[i * 4 + MIC_SLOT_INDEX] >> 16;
+    const int32_t b = i2sTxStereoFrame[i * 4 + 2 + MIC_SLOT_INDEX] >> 16;
+    micTxMonoFrame[i] = amplifyAudioForApp((a + b) / 2);
+  }
+}
+
 void sendMicToBrowser() {
   static bool wasTransmitting = false;
   static uint32_t lastCaptureFinished = 0;
   const uint32_t now = (uint32_t)millis();
+  if (aecResetRequested.exchange(false)) {
+    aecCaptureEnabled.store(false);
+    wasTransmitting = false;
+  }
   if (lastCaptureFinished != 0 && now - lastCaptureFinished > 80UL) {
+    aecCaptureEnabled.store(false);
     discardMicBacklog();
     wasTransmitting = false;
   }
   const bool transmittingAtStart = callActive && wsTxConnected &&
       !wsTxCloseRequested && isNetworkConnected();
   const bool mutedAtStart = micMutedByLocalTone();
+  const bool remoteMutedAtStart = micMutedByRemoteAudio();
   size_t bytesIn = 0;
   esp_err_t result = i2s_read(I2S_MIC_PORT, (void*)i2sTxStereoFrame, sizeof(i2sTxStereoFrame), &bytesIn, pdMS_TO_TICKS(80));
   lastCaptureFinished = (uint32_t)millis();
-  if (result != ESP_OK) { txReadErrors++; wasTransmitting = false; return; }
+  if (result != ESP_OK) { txReadErrors++; wasTransmitting = false; aecCaptureEnabled.store(false); return; }
   if (bytesIn < sizeof(i2sTxStereoFrame)) {
     txReadShorts++;
     wasTransmitting = false;
+    aecCaptureEnabled.store(false);
     return;
   }
   if (!transmittingAtStart || !callActive || !wsTxConnected ||
       wsTxCloseRequested || !isNetworkConnected()) {
     wasTransmitting = false;
+    aecCaptureEnabled.store(false);
+    return;
+  }
+  if (aecResetRequested.load()) {
+    aecCaptureEnabled.store(false);
+    wasTransmitting = false;
     return;
   }
   if (!wasTransmitting) {
     // No enviar muestras capturadas antes de contestar o durante una reconexión.
+    if (audioAecAvailable) {
+      // Reutilizar el modelo: no reservar/destruir memoria en cada llamada o corte.
+      resetEchoReference();
+      aecWarmupFramesRemaining = AEC_TRAMAS_CALENTAMIENTO;
+    }
     discardMicBacklog();
+    lastCaptureFinished = (uint32_t)millis();
+    aecCaptureEnabled.store(audioAecAvailable);
     wasTransmitting = true;
     return;
   }
 
+  // AEC a 16 kHz si esta disponible; si no, priorizar la voz del parlante.
+  if (audioAecAvailable) {
+    if (!cancelMicEcho()) wasTransmitting = false;
+  } else {
+    convertirMicSinAec(remoteMutedAtStart || micMutedByRemoteAudio());
+  }
   if (mutedAtStart || micMutedByLocalTone()) {
     memset(micTxMonoFrame, 0, sizeof(micTxMonoFrame));
-  } else {
-    for (int i = 0; i < TX_NET_SAMPLES; i++) {
-      int32_t a = i2sTxStereoFrame[i * 4 + MIC_SLOT_INDEX] >> 16;
-      int32_t b = i2sTxStereoFrame[i * 4 + 2 + MIC_SLOT_INDEX] >> 16;
-      int32_t mixed = (a + b) / 2;
-      micTxMonoFrame[i] = amplifyAudioForApp(mixed);
-    }
   }
-  if (!callActive || !wsTxConnected || wsTxCloseRequested) return;
+  if (!callActive || !wsTxConnected || wsTxCloseRequested || aecResetRequested.load()) return;
 
   bool ok = wsTxClient.sendBinary((const char*)micTxMonoFrame, sizeof(micTxMonoFrame));
   if (ok) { 
@@ -1451,6 +1743,7 @@ void sendMicToBrowser() {
   } else { 
     txSendFails++; 
     wasTransmitting = false;
+    aecCaptureEnabled.store(false);
     if (!wsTxClient.available()) {
       wsTxConnected = false;
     }
@@ -1929,9 +2222,10 @@ void checkButtonPin2() {
       buttonState2 = reading2;
       if (buttonState2 == LOW) {
         Serial.println("[BOTON 2] Presionado GPIO 2");
-        if (ledEnclavado) {
+        if (ledEnclavado || ledIndicacionActiva) {
           ledEnclavado = false;
-          Serial.println("[LED] Desenclavado manualmente con el botón de aviso.");
+          ledApagadoPendiente = true;
+          Serial.println("[LED] Indicador apagado manualmente con el botón de aviso.");
         } else {
           apiEnviarAlerta();           
           apiCrearRecadoDesdeAlerta(); 
@@ -1983,30 +2277,50 @@ void checkDoorButtons() {
 }
 
 void handleLedControl() {
-  if (callWanted || incomingRinging) {
-    if (millis() - lastLedBlinkTime >= 500) {
-      lastLedBlinkTime = millis();
-      ledBlinkState = !ledBlinkState;
-      digitalWrite(LED_NOTICE_PIN, ledBlinkState ? HIGH : LOW);
-    }
+  static bool silenciado = false;
+  static bool llamadaAnterior = false;
+  static bool emergenciaAnterior = false;
+  static uint32_t generacionEmergenciaAnterior = 0;
+  const unsigned long ahora = millis();
+  const bool llamada = callWanted || incomingRinging || callActive;
+  uint32_t generacionEmergencia = 0;
+  const bool emergencia = emergenciaEnCurso(&generacionEmergencia);
+
+  // Un nuevo evento vuelve a habilitar el indicador tras un apagado manual.
+  if (ledEnclavado || (llamada && !llamadaAnterior) ||
+      (emergencia && (!emergenciaAnterior ||
+                     generacionEmergencia != generacionEmergenciaAnterior))) {
+    silenciado = false;
+  }
+  llamadaAnterior = llamada;
+  emergenciaAnterior = emergencia;
+  generacionEmergenciaAnterior = generacionEmergencia;
+
+  // Se procesa despues de los eventos para que la pulsacion tenga prioridad.
+  if (ledApagadoPendiente) {
+    ledApagadoPendiente = false;
+    ledEnclavado = false;
+    silenciado = true;
+  }
+
+  const bool avisoActivo = llamada || emergencia || ledEnclavado;
+  const unsigned long intervalo = avisoActivo ? 1000UL
+      : ((wifiConnecting || !isNetworkConnected()) ? 500UL : 0UL);
+  const bool parpadear = intervalo != 0 && !silenciado;
+  if (!parpadear) {
+    ledIndicacionActiva = false;
+    ledBlinkState = false;
+    digitalWrite(LED_NOTICE_PIN, LOW);
     return;
   }
 
-  if (wifiConnecting || !isNetworkConnected()) {
-    if (millis() - lastLedBlinkTime >= 250) {
-      lastLedBlinkTime = millis();
-      ledBlinkState = !ledBlinkState;
-      digitalWrite(LED_NOTICE_PIN, ledBlinkState ? HIGH : LOW);
-    }
-    return;
+  // Enciende inmediatamente al activar y mantiene sincronizado el estado fisico.
+  if (!ledIndicacionActiva || ahora - lastLedBlinkTime >= intervalo) {
+    lastLedBlinkTime = ahora;
+    ledBlinkState = !ledIndicacionActiva || !ledBlinkState;
   }
-
-  if (emergenciaEnCurso(nullptr) || ledEnclavado) {
-    digitalWrite(LED_NOTICE_PIN, HIGH);
-    return;
-  }
-
-  digitalWrite(LED_NOTICE_PIN, LOW);
+  ledIndicacionActiva = true;
+  digitalWrite(LED_NOTICE_PIN, ledBlinkState ? HIGH : LOW);
 }
 
 void handleUsbDebugInput() {
@@ -2074,16 +2388,27 @@ void setup() {
   digitalWrite(LED_NOTICE_PIN, LOW);
 
   Serial.println("===========================================");
-  Serial.println("GLADIATOR CITOFONO - VERSIÓN BOTÓN GPIO 1 Y GPIO 2");
+  Serial.println("GLADIATOR CITOFONO - ESP32-S3 DEV MODULE / DEVKIT");
   Serial.println("===========================================");
 
+  Serial.printf("[PLACA] %s; Arduino-ESP32 %s; IDF %s.\n",
+                ESP.getChipModel(), ESP_ARDUINO_VERSION_STR, ESP.getSdkVersion());
+  Serial.printf("[PLACA] Flash: %u; PSRAM detectada: %u bytes; heap: %u bytes.\n",
+                ESP.getFlashChipSize(), ESP.getPsramSize(), ESP.getFreeHeap());
+  Serial.printf("[GPIO] MIC SD/WS/SCK=%d/%d/%d; DAC DOUT/WS/SCK=%d/%d/%d; LED externo=%d.\n",
+                I2S_MIC_SD, I2S_MIC_WS, I2S_MIC_SCK, I2S_SPK_DOUT, I2S_SPK_WS, I2S_SPK_SCK, LED_NOTICE_PIN);
+  Serial.println("[ARRANQUE] Cargando configuracion Wi-Fi.");
   loadWiFiConfig();
+  Serial.println("[ARRANQUE] Inicializando radio Wi-Fi.");
   connectWiFi();
+  Serial.println("[ARRANQUE] Configurando WebSockets.");
   setupWebSockets();
 
+  Serial.println("[ARRANQUE] Creando colas de control.");
   ESP_ERROR_CHECK(initCallControl() ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(initAudioControl() ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(initNotificationControl() ? ESP_OK : ESP_ERR_NO_MEM);
+  Serial.println("[ARRANQUE] Inicializando I2S.");
   i2s_install();
   i2s_setpin();
   ESP_ERROR_CHECK(i2s_zero_dma_buffer(I2S_SPK_PORT));
@@ -2093,9 +2418,12 @@ void setup() {
     Serial.println("[PUERTAS] Error al crear la cola.");
   }
 
+  Serial.println("[ARRANQUE] Comprobando memoria e inicializando AEC.");
+  audioAecAvailable = initEchoCancellation();
+  Serial.println("[ARRANQUE] Creando tareas de audio y red.");
   ESP_ERROR_CHECK(xTaskCreatePinnedToCore(audioPlaybackTask, "audioPlayback", 4096, NULL, 4, NULL, 0) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(xTaskCreatePinnedToCore(audioWsRxTask, "audioWsRx", 4096, NULL, 1, NULL, 1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-  ESP_ERROR_CHECK(xTaskCreatePinnedToCore(audioMicTxTask, "audioMicTx", 6144, NULL, 2, NULL, 1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+  ESP_ERROR_CHECK(xTaskCreatePinnedToCore(audioMicTxTask, "audioMicTx", 8192, NULL, 2, NULL, 1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(xTaskCreatePinnedToCore(backendPollTask, "backendPoll", 8192, NULL, 1, NULL, 1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(xTaskCreatePinnedToCore(backendEmergencyTask, "backendEmergency", 8192, NULL, 1, NULL, 1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
   ESP_ERROR_CHECK(xTaskCreatePinnedToCore(notificationTask, "notifications", 6144, NULL, 1, NULL, 1) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
@@ -2103,6 +2431,12 @@ void setup() {
   Serial.println("Sistema de citofonia listo para operar.");
   Serial.println("Creado por Ricardo Morales");
   Serial.println("Audio: I2S 16 kHz; red PCM16 mono 8 kHz.");
+  if (audioAecAvailable) {
+    Serial.printf("[AEC] ESP-SR FD activo: %d muestras, referencia %d ms.\n",
+                  TX_I2S_SAMPLES, AEC_REFERENCE_DELAY_MS);
+  } else {
+    Serial.println("[AUDIO] Modo alternado: microfono silenciado mientras suena el parlante.");
+  }
 }
 
 void loop() {

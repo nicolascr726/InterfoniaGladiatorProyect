@@ -37,6 +37,7 @@ class _HorariosModalState extends State<HorariosModal> {
   String _filtroHistorial = 'Todos';
   bool _cargando = true;
   bool _guardando = false;
+  int? _registrandoRegresoId;
   String? _errorCarga;
   String? _errorFormulario;
 
@@ -233,6 +234,61 @@ class _HorariosModalState extends State<HorariosModal> {
     }
   }
 
+  Future<void> _registrarRegreso(Map<String, dynamic> horario) async {
+    if (_guardando || _cargando) return;
+    final id = horario['id'];
+    final rut = widget.miRut.trim();
+    if (id is! int || id <= 0 || rut.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('No se pudo identificar el horario o el usuario.')));
+      return;
+    }
+    setState(() {
+      _guardando = true;
+      _registrandoRegresoId = id;
+    });
+    try {
+      final response = await _client
+          .post(
+            Uri.parse('$kBaseUrl/horarios/$id/regreso'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'rut': rut}),
+          )
+          .timeout(const Duration(seconds: 15));
+      final data = _leerRespuesta(response);
+      if (data is! Map || data['success'] != true || data['horario'] is! Map) {
+        throw Exception('No se pudo confirmar el regreso.');
+      }
+      final actualizado = Map<String, dynamic>.from(data['horario'] as Map);
+      if (actualizado['id'] != id || actualizado['estado'] != 'Finalizado') {
+        throw Exception(
+            'El servidor no confirmó la finalización de este horario.');
+      }
+      if (!mounted) return;
+      setState(() {
+        final indice = _horarios.indexWhere((item) => item['id'] == id);
+        if (indice >= 0) _horarios[indice] = actualizado;
+      });
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(
+            content: Text('Regreso registrado. El horario ha finalizado.')));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(_mensajeError(error))));
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _guardando = false;
+          _registrandoRegresoId = null;
+        });
+      }
+    }
+  }
+
   ThemeData _tema(BuildContext context) {
     final base = Theme.of(context);
     return base.copyWith(
@@ -300,6 +356,10 @@ class _HorariosModalState extends State<HorariosModal> {
     final fin = _fechaRegistro(horario['fecha_fin']);
     if (inicio == null || fin == null || !fin.isAfter(inicio)) {
       return 'Sin fecha';
+    }
+    if (horario['estado'] == 'Finalizado' ||
+        _fechaRegistro(horario['fecha_regreso']) != null) {
+      return 'Finalizado';
     }
     final ahora = DateTime.now();
     if (!fin.isAfter(ahora)) return 'Finalizado';
@@ -549,7 +609,8 @@ class _HorariosModalState extends State<HorariosModal> {
 
   Widget _registro(Map<String, dynamic> horario) {
     final inicio = _fechaRegistro(horario['fecha_inicio']);
-    final fin = _fechaRegistro(horario['fecha_fin']);
+    final fin =
+        _fechaRegistro(horario['fecha_regreso'] ?? horario['fecha_fin']);
     final estado = _estadoHorario(horario);
     final color = estado == 'En curso' ? _colorRegreso : _colorSecundario;
     return Padding(
@@ -586,6 +647,33 @@ class _HorariosModalState extends State<HorariosModal> {
             child: Divider(height: 1, color: _colorBorde),
           ),
           _lineaRegistro(_etiquetaFin, fin, Icons.login_rounded),
+          if (estado == 'En curso') ...[
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                key: ValueKey('registrar-regreso-${horario['id']}'),
+                onPressed: _guardando || _cargando
+                    ? null
+                    : () => _registrarRegreso(horario),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _colorRegreso,
+                  foregroundColor: _colorFondo,
+                  minimumSize: const Size(0, 48),
+                  elevation: 0,
+                ),
+                icon: _registrandoRegresoId == horario['id']
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.login_rounded),
+                label: Text(_registrandoRegresoId == horario['id']
+                    ? 'Registrando regreso...'
+                    : 'Registrar regreso'),
+              ),
+            ),
+          ],
         ],
       )),
     );
