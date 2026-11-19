@@ -1,15 +1,19 @@
 /*
-  Lector QR/RFID + MP3 + un rele: PUERTA 3.
-  Placa: ESP32
+  GLADIATOR | INICIO DEL LECTOR QR/RFID
+  Control de acceso mediante tarjetas y solicitudes desde la app.
+  Placa: ESP32 | Puerta: 3.
 
   Configurar WIFI_SSID, WIFI_PASSWORD y RFID_READER_TOKEN antes de cargar.
   RFID_READER_TOKEN debe coincidir con la variable del mismo nombre en Flask.
   Registrar las tarjetas mediante /api/rfid antes de utilizarlas.
 
   El servidor valida la tarjeta, registra la autorizacion y aplica 15 segundos
-  de espera por tarjeta. Solo se abre ante HTTP 200 y autorizado=true para
-  puerta 3. Sin red, hora valida, TLS o autorizacion, el rele permanece apagado.
+  de espera por tarjeta. La tarjeta requiere HTTP 200 y autorizado=true para
+  puerta 3. La app usa un canal TLS independiente con device_id y rut_usuario,
+  el mismo RFID_READER_TOKEN y una autorizacion de hasta cinco segundos.
+  Sin hora valida, TLS o autorizacion, el rele permanece apagado.
   La respuesta autoriza el acceso; no confirma la apertura fisica de la puerta.
+  Instalar ArduinoWebsockets ademas de ArduinoJson para recibir ordenes de la app.
 
   Este lector tambien puede leer QR, pero la API actual solo admite numeros
   RFID registrados (1 a 32 digitos). ACCESOQR_1 y ACCESOQR_3 no dan acceso.
@@ -20,6 +24,7 @@
 #include <HTTPClient.h>
 #define ARDUINOJSON_USE_LONG_LONG 1
 #include <ArduinoJson.h>
+#include <ArduinoWebsockets.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -42,6 +47,8 @@ const unsigned long TIEMPO_APERTURA_MS = 5000;
 const unsigned long REINTENTO_WIFI_MS = 10000;
 const unsigned long FIN_LECTURA_MS = 50;
 const unsigned long RESPUESTA_MAX_MS = 10000;
+const char* PUERTAS_APP_HOST = "video.gladiatorcontrolbase.com";
+const char* ESP32_DEVICE_ID = "apertura-3";
 const size_t MAX_NUMERO_TARJETA = 32;
 
 HardwareSerial SerialMP3(1);
@@ -56,6 +63,43 @@ bool relojConfigurado = false;
 unsigned long ultimaRecepcion = 0;
 unsigned long aperturaIniciada = 0;
 uint64_t aperturaAutorizadaHastaMs = 0;
+
+struct OrdenAperturaApp {
+  uint64_t autorizacionHastaMs;
+};
+QueueHandle_t colaAperturasApp = nullptr;
+
+// Conservar TLS verificado tambien en el WebSocket; la biblioteca no expone
+// el bundle del ESP32 en connectSecure(), por eso se proporciona el transporte.
+class ConexionPuerta3TLS : public websockets::network::SecuredEsp32TcpClient {
+public:
+  bool connect(const websockets::WSString& host, const int port) override {
+    client.useBuiltinCACertBundle();
+    client.setHandshakeTimeout(4);
+    const bool conectado = client.connect(host.c_str(), port, 2000);
+    client.setNoDelay(true);
+    return conectado;
+  }
+
+  uint32_t read(uint8_t* buffer, const uint32_t len) override {
+    uint32_t recibidos = 0;
+    const unsigned long inicio = millis();
+    while (recibidos < len && client.connected() && millis() - inicio < 1000) {
+      const int n = client.read(buffer + recibidos, len - recibidos);
+      if (n > 0) recibidos += n;
+      else vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (recibidos != len) {
+      client.stop();
+      return 0;
+    }
+    return recibidos;
+  }
+};
+
+websockets::WebsocketsClient wsPuerta3(std::make_shared<ConexionPuerta3TLS>());
+bool appConectada = false;  // Solo la tarea de red utiliza este estado.
+unsigned long ultimoPongApp = 0;
 
 void revisarRele();
 
@@ -122,6 +166,84 @@ void revisarRele() {
     releActivo = false;
     descartarLecturasPendientes();
     Serial.println("[PUERTA 3] Rele apagado.");
+  }
+}
+
+void recibirOrdenApp(websockets::WebsocketsMessage mensaje) {
+  if (!mensaje.isText()) return;
+  const String texto = mensaje.data();
+  if (texto.length() > 1024) return;
+  JsonDocument orden;
+  if (deserializeJson(orden, texto) ||
+      String(orden["accion"] | "") != "abrir" ||
+      !orden["puerta"].is<int>() || orden["puerta"].as<int>() != PUERTA ||
+      String(orden["rut_propietario_puerta"] | "") != RUT_PROPIETARIO_PUERTA ||
+      !orden["tiempo_apertura_ms"].is<unsigned long>() ||
+      orden["tiempo_apertura_ms"].as<unsigned long>() != TIEMPO_APERTURA_MS ||
+      !orden["autorizacion_hasta_ms"].is<uint64_t>()) return;
+  const OrdenAperturaApp apertura = {orden["autorizacion_hasta_ms"].as<uint64_t>()};
+  if (xQueueSend(colaAperturasApp, &apertura, 0) != pdPASS) {
+    Serial.println("[APP] Orden descartada: ya hay una apertura pendiente.");
+  }
+}
+
+void atenderAperturaApp() {
+  OrdenAperturaApp orden;
+  if (colaAperturasApp == nullptr || xQueueReceive(colaAperturasApp, &orden, 0) != pdPASS) return;
+  const uint64_t ahora = horaEpochMilisegundos();
+  if (releActivo || ahora < 1700000000000ULL || ahora >= orden.autorizacionHastaMs ||
+      orden.autorizacionHastaMs - ahora > TIEMPO_APERTURA_MS) {
+    Serial.println("[APP] Orden caducada o rele ocupado; no se modifica la apertura.");
+    return;
+  }
+  aperturaAutorizadaHastaMs = orden.autorizacionHastaMs;
+  aperturaIniciada = millis();
+  releActivo = true;
+  digitalWrite(RELAY_PIN, LOW);
+  Serial.println("[PUERTA 3] Solicitud de apertura desde la app recibida.");
+}
+
+void tareaPuertaApp(void* parametro) {
+  (void)parametro;
+  wsPuerta3.addHeader("Authorization", String("Bearer ") + RFID_READER_TOKEN);
+  wsPuerta3.onMessage(recibirOrdenApp);
+  wsPuerta3.onEvent([](websockets::WebsocketsEvent evento, String datos) {
+    (void)datos;
+    if (evento == websockets::WebsocketsEvent::ConnectionOpened) {
+      appConectada = true;
+      ultimoPongApp = millis();
+      Serial.println("[APP] Puerta 3 conectada al backend.");
+    } else if (evento == websockets::WebsocketsEvent::ConnectionClosed) {
+      appConectada = false;
+    } else if (evento == websockets::WebsocketsEvent::GotPong) {
+      ultimoPongApp = millis();
+    }
+  });
+  unsigned long ultimoIntento = millis() - 5000;
+  unsigned long ultimoPing = millis();
+  const String ruta = String("/esp32_puertas?device_id=") + ESP32_DEVICE_ID +
+      "&rut_usuario=" + RUT_PROPIETARIO_PUERTA + "&puertas=" + String(PUERTA);
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED || time(nullptr) < 1700000000) {
+      if (appConectada) wsPuerta3.close();
+      appConectada = false;
+    } else {
+      if (!appConectada && millis() - ultimoIntento >= 5000) {
+        ultimoIntento = millis();
+        // connect(host, puerto, ruta) conserva el transporte TLS configurado arriba.
+        wsPuerta3.connect(PUERTAS_APP_HOST, 443, ruta);
+        ultimoPing = millis();
+      }
+      if (appConectada) {
+        wsPuerta3.poll();
+        if (millis() - ultimoPing >= 10000) {
+          ultimoPing = millis();
+          wsPuerta3.ping();
+        }
+        if (millis() - ultimoPongApp >= 30000) wsPuerta3.close();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -292,6 +414,9 @@ void setup() {
   digitalWrite(RELAY_PIN, HIGH);
   pinMode(RELAY_PIN, OUTPUT);
   Serial.begin(115200);
+  Serial.println("\n[INICIO] Gladiator | Lector QR/RFID");
+  Serial.printf("[INICIO] Dispositivo: %s | Puerta: %d\n", ESP32_DEVICE_ID, PUERTA);
+  Serial.println("[INICIO] Inicializando el sistema de acceso...");
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   SerialMP3.begin(9600, SERIAL_8N1, MP3_RX_PIN, MP3_TX_PIN);
   tokenLeido.reserve(MAX_NUMERO_TARJETA);
@@ -306,11 +431,17 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   ultimoReintentoWiFi = millis();
-  Serial.println("[PUERTA 3] Sistema iniciado. Esperando red y lectura RFID.");
+  colaAperturasApp = xQueueCreate(1, sizeof(OrdenAperturaApp));
+  if (colaAperturasApp == nullptr ||
+      xTaskCreate(tareaPuertaApp, "puerta3App", 8192, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("[APP] No se pudo iniciar el canal de apertura; RFID sigue disponible.");
+  }
+  Serial.println("[INICIO] Lector preparado para tarjetas y solicitudes de apertura.");
 }
 
 void loop() {
   revisarRele();
+  atenderAperturaApp();
   gestionarRed();
   leerCredencial();
   delay(1);

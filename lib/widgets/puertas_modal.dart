@@ -11,6 +11,7 @@ import '../helpers/filtro_fecha_hora.dart';
 class PuertasModal extends StatefulWidget {
   static const String abrirPuertaEndpoint = '$kBaseUrl/api/puertas';
   static const String registrosEndpoint = '$kBaseUrl/api/puertas';
+  static const Set<int> puertasHabilitadas = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
   final String miRut;
   final http.Client? client;
   final bool soloApertura;
@@ -219,11 +220,13 @@ class _PuertasModalState extends State<PuertasModal> {
   }
 
   Future<void> _registrarPuerta(int puerta) async {
-    if (!_puedeAbrirPuertas || _enviandoPuerta != null) return;
+    if (!_puedeAbrirPuertas ||
+        _enviandoPuerta != null ||
+        !PuertasModal.puertasHabilitadas.contains(puerta)) return;
     setState(() => _enviandoPuerta = puerta);
     String mensaje;
     try {
-      // El endpoint registra la solicitud y envía la orden de apertura.
+      // El servidor registra únicamente las órdenes que consigue enviar.
       final response = await _client
           .post(
             Uri.parse(PuertasModal.abrirPuertaEndpoint),
@@ -231,9 +234,9 @@ class _PuertasModalState extends State<PuertasModal> {
             body: jsonEncode({
               'rut': widget.miRut,
               'puerta': puerta,
-              'titulo': 'Apertura de puerta ${puerta == 1 ? 'uno' : 'dos'}',
+              'titulo': 'Solicitud de apertura de puerta $puerta',
               'descripcion':
-                  'Se abrió la puerta ${puerta == 1 ? 'uno' : 'dos'}.',
+                  'Solicitud de apertura de puerta $puerta desde la app.',
             }),
           )
           .timeout(const Duration(seconds: 10));
@@ -241,8 +244,7 @@ class _PuertasModalState extends State<PuertasModal> {
       if (data is! Map || data['success'] != true || data['registro'] is! Map) {
         throw Exception('No se pudo confirmar el registro de la puerta.');
       }
-      mensaje =
-          'Se registró la apertura de la puerta ${puerta == 1 ? 'uno' : 'dos'}.';
+      mensaje = 'Solicitud de apertura de puerta $puerta enviada.';
     } on TimeoutException {
       mensaje =
           'El servidor no respondió a tiempo. No se pudo confirmar el registro.';
@@ -258,11 +260,14 @@ class _PuertasModalState extends State<PuertasModal> {
   }
 
   Widget _botonPuerta(int puerta) {
+    final habilitada = PuertasModal.puertasHabilitadas.contains(puerta);
     return SizedBox(
       width: double.infinity,
       child: ElevatedButton.icon(
-        onPressed:
-            _enviandoPuerta == null ? () => _registrarPuerta(puerta) : null,
+        key: ValueKey('abrir_puerta_$puerta'),
+        onPressed: habilitada && _enviandoPuerta == null
+            ? () => _registrarPuerta(puerta)
+            : null,
         style: ElevatedButton.styleFrom(
           backgroundColor: const Color(0xFF222233),
           foregroundColor: const Color(0xFF448AFF),
@@ -270,10 +275,13 @@ class _PuertasModalState extends State<PuertasModal> {
           shape:
               RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
         ),
-        icon: const Icon(Icons.lock_open_rounded),
+        icon:
+            Icon(habilitada ? Icons.lock_open_rounded : Icons.hourglass_empty),
         label: Text(_enviandoPuerta == puerta
-            ? 'Registrando...'
-            : 'Abrir puerta ${puerta == 1 ? 'uno' : 'dos'}'),
+            ? 'Enviando...'
+            : habilitada
+                ? 'Abrir puerta $puerta'
+                : 'Puerta $puerta — pendiente'),
       ),
     );
   }
@@ -518,9 +526,10 @@ class _PuertasModalState extends State<PuertasModal> {
                 const SizedBox(height: 12),
               ],
               if (_puedeAbrirPuertas) ...[
-                _botonPuerta(1),
-                const SizedBox(height: 14),
-                _botonPuerta(2),
+                for (var puerta = 1; puerta <= 10; puerta++) ...[
+                  _botonPuerta(puerta),
+                  if (puerta < 10) const SizedBox(height: 14),
+                ],
               ],
               if (_mostrarReporte) ...[
                 Row(

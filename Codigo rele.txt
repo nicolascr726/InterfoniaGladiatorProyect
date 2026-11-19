@@ -1,15 +1,22 @@
 /////////////////////////////////////////////////////////////////
 /*
-  ESP32 N.° 2 - Control de Relés Dual (Ethernet W5500 + Wi-Fi)
+  GLADIATOR | INICIO DEL CONTROLADOR DE PUERTAS
+  Equipo ESP32 de apertura para puertas comunes.
+  Comunicacion: Ethernet W5500 + Wi-Fi.
   Pines asignados:
   - W5500: SCK(18), MISO(19), MOSI(23), CS(5), RST(4)
   - Relés: IN1(26), IN2(27)
+  Identidad configurable: ESP32_DEVICE_ID, DEVICE_RUT y puertas de cada rele.
+  APERTURA_READER_TOKEN debe coincidir con el del backend; si no se configura
+  esa variable en Flask, el backend utiliza RFID_READER_TOKEN como respaldo.
 */
 /////////////////////////////////////////////////////////////////
 
 #include <SPI.h>
 #include <ETH.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
 #include <ArduinoWebsockets.h>
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
@@ -25,6 +32,8 @@ const int W5500_RST_PIN = 4;   // RST -> GPIO 4
 
 const int RELE1_PIN     = 26;  // IN1 -> GPIO 26 (Puerta 1)
 const int RELE2_PIN     = 27;  // IN2 -> GPIO 27 (Puerta 2)
+const uint16_t PUERTA_RELE_1 = 1;
+const uint16_t PUERTA_RELE_2 = 2;
 
 // === TIEMPOS DE PULSO DE APERTURA POR SEPARADO (Milisegundos) ===
 const unsigned long TIEMPO_PUERTA_1_MS = 2000; // 2 segundos activo
@@ -40,18 +49,22 @@ IPAddress ethStaticIp(192, 168, 1, 200);
 IPAddress ethGateway(192, 168, 1, 1);
 IPAddress ethSubnet(255, 255, 255, 0);
 NetworkServer servidorLocal(80);
-const char* WS_PUERTAS_URL =
-  "ws://209.46.126.62:6666/esp32_puertas?device_id=apertura-1";
+const char* WS_PUERTAS_HOST = "video.gladiatorcontrolbase.com";
+const char* ESP32_DEVICE_ID = "apertura-1";
+const char* DEVICE_RUT = "11111111";
+const char* APERTURA_READER_TOKEN = "afdc8a972a767f0b5f4bcf9a9a3d2e30d546a05d4cb0ac4551ffd8ce842117ba";
 
 struct OrdenRele {
-  uint8_t puerta;
+  uint16_t puerta;
   bool abrir;
   uint32_t creadaEn;
 };
 QueueHandle_t colaReles = nullptr;
-class TcpBackend : public websockets::network::Esp32TcpClient {
+class TcpBackend : public websockets::network::SecuredEsp32TcpClient {
 public:
   bool connect(const websockets::WSString& host, const int port) override {
+    client.useBuiltinCACertBundle();
+    client.setHandshakeTimeout(4);
     bool ok = client.connect(host.c_str(), port, 2000);
     client.setNoDelay(true);
     return ok;
@@ -76,26 +89,26 @@ void activarPuerta1() {
   digitalWrite(RELE1_PIN, LOW); // Activa el relé (Active-LOW)
   rele1Activo = true;
   rele1TiempoApagado = millis() + TIEMPO_PUERTA_1_MS;
-  Serial.printf("[RELÉ] *** PUERTA 1 ACTIVADA (GPIO 26) POR %lu ms ***\n", TIEMPO_PUERTA_1_MS);
+  Serial.printf("[RELÉ] PUERTA %u ACTIVADA (GPIO 26) POR %lu ms\n", PUERTA_RELE_1, TIEMPO_PUERTA_1_MS);
 }
 
 void activarPuerta2() {
   digitalWrite(RELE2_PIN, LOW); // Activa el relé (Active-LOW)
   rele2Activo = true;
   rele2TiempoApagado = millis() + TIEMPO_PUERTA_2_MS;
-  Serial.printf("[RELÉ] *** PUERTA 2 ACTIVADA (GPIO 27) POR %lu ms ***\n", TIEMPO_PUERTA_2_MS);
+  Serial.printf("[RELÉ] PUERTA %u ACTIVADA (GPIO 27) POR %lu ms\n", PUERTA_RELE_2, TIEMPO_PUERTA_2_MS);
 }
 
 void desactivarPuerta1() {
   digitalWrite(RELE1_PIN, HIGH);
   rele1Activo = false;
-  Serial.println("[RELÉ] Puerta 1 desactivada (Cerrada).");
+  Serial.printf("[RELÉ] Puerta %u desactivada (Cerrada).\n", PUERTA_RELE_1);
 }
 
 void desactivarPuerta2() {
   digitalWrite(RELE2_PIN, HIGH);
   rele2Activo = false;
-  Serial.println("[RELÉ] Puerta 2 desactivada (Cerrada).");
+  Serial.printf("[RELÉ] Puerta %u desactivada (Cerrada).\n", PUERTA_RELE_2);
 }
 
 // Control de temporizador no bloqueante (usa millis)
@@ -111,8 +124,8 @@ void conectarWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 }
 
-bool encolarOrdenRele(uint8_t puerta, bool abrir) {
-  if (puerta != 1 && puerta != 2) return false;
+bool encolarOrdenRele(uint16_t puerta, bool abrir) {
+  if (puerta != PUERTA_RELE_1 && puerta != PUERTA_RELE_2) return false;
   OrdenRele orden = {puerta, abrir, millis()};
   if (colaReles == nullptr || xQueueSend(colaReles, &orden, 0) != pdPASS) {
     Serial.println("[PUERTAS] Cola llena o no disponible; orden descartada.");
@@ -132,15 +145,15 @@ void recibirOrdenBackend(websockets::WebsocketsMessage mensaje) {
   }
   const char* accion = doc["accion"] | "";
   if (strcmp(accion, "abrir") != 0 || !doc["puerta"].is<int>()) {
-    Serial.println("[BACKEND] Se esperaba accion abrir y puerta numerica 1 o 2.");
+    Serial.println("[BACKEND] Se esperaba accion abrir y puerta numerica asignada a este dispositivo.");
     return;
   }
   int puerta = doc["puerta"].as<int>();
-  if (puerta != 1 && puerta != 2) {
+  if (puerta != PUERTA_RELE_1 && puerta != PUERTA_RELE_2) {
     Serial.println("[BACKEND] Puerta invalida; orden ignorada.");
     return;
   }
-  if (encolarOrdenRele((uint8_t)puerta, true)) {
+  if (encolarOrdenRele((uint16_t)puerta, true)) {
     Serial.printf("[PUERTAS] Orden recibida para puerta %d.\n", puerta);
   }
 }
@@ -191,6 +204,9 @@ void tareaRedPuertas(void* parametro) {
   bool pausaEthernet = false;
   bool ipFijaAplicada = false;
   bool esperandoIpEthernet = false;
+  bool relojSolicitado = false;
+  const String ruta = String("/esp32_puertas?device_id=") + ESP32_DEVICE_ID +
+    "&rut_usuario=" + DEVICE_RUT + "&puertas=" + String(PUERTA_RELE_1) + "," + String(PUERTA_RELE_2);
   for (;;) {
     uint32_t ahora = millis();
     if (WiFi.status() != WL_CONNECTED && ahora - ultimoIntentoWiFi >= 10000) {
@@ -236,10 +252,19 @@ void tareaRedPuertas(void* parametro) {
         ipActual.toString().c_str());
       ultimoIntento = millis() - 5000;
     }
-    if (redActual != 0 && !wsConectado && millis() - ultimoIntento >= 5000) {
+    if (redActual != 0 && !relojSolicitado) {
+      configTime(0, 0, "pool.ntp.org", "time.google.com");
+      relojSolicitado = true;
+    }
+    if (redActual != 0 && time(nullptr) >= 1700000000 &&
+        strlen(APERTURA_READER_TOKEN) > 0 &&
+        strcmp(APERTURA_READER_TOKEN, "CONFIGURAR_TOKEN_APERTURA") != 0 &&
+        !wsConectado && millis() - ultimoIntento >= 5000) {
       ultimoIntento = millis();
-      Serial.println("[BACKEND] Intentando conectar WebSocket de apertura-1...");
-      bool ok = wsPuertas.connect(WS_PUERTAS_URL);
+      Serial.printf("[BACKEND] Conectando device_id=%s rut_usuario=%s puertas=%u,%u\n",
+        ESP32_DEVICE_ID, DEVICE_RUT, PUERTA_RELE_1, PUERTA_RELE_2);
+      // Este overload conserva el transporte TLS con certificados verificados.
+      bool ok = wsPuertas.connect(WS_PUERTAS_HOST, 443, ruta);
       if (!ok) Serial.println("[BACKEND] No se pudo conectar; se reintentara.");
       if (!ok && redActual == 1) {
         pausaEthernet = true;
@@ -271,10 +296,10 @@ void tareaRedPuertas(void* parametro) {
 
 void procesarSolicitudCliente(String req, Print& responseStream) {
   bool ok = true;
-  if (req.indexOf("GET /r1/on") >= 0) ok = encolarOrdenRele(1, true);
-  else if (req.indexOf("GET /r1/off") >= 0) ok = encolarOrdenRele(1, false);
-  if (req.indexOf("GET /r2/on") >= 0) ok = encolarOrdenRele(2, true) && ok;
-  else if (req.indexOf("GET /r2/off") >= 0) ok = encolarOrdenRele(2, false) && ok;
+  if (req.indexOf("GET /r1/on") >= 0) ok = encolarOrdenRele(PUERTA_RELE_1, true);
+  else if (req.indexOf("GET /r1/off") >= 0) ok = encolarOrdenRele(PUERTA_RELE_1, false);
+  if (req.indexOf("GET /r2/on") >= 0) ok = encolarOrdenRele(PUERTA_RELE_2, true) && ok;
+  else if (req.indexOf("GET /r2/off") >= 0) ok = encolarOrdenRele(PUERTA_RELE_2, false) && ok;
   if (!ok) {
     responseStream.println("HTTP/1.1 503 Service Unavailable");
     responseStream.println("Content-Type: text/plain");
@@ -296,19 +321,22 @@ void procesarSolicitudCliente(String req, Print& responseStream) {
   responseStream.println(".btn{padding:15px 25px;font-size:18px;margin:10px;color:white;background-color:#008CBA;border:none;border-radius:5px;cursor:pointer;}</style></head><body>");
 
   responseStream.println("<h2>Receptor de Puertas ESP32 Dual - Gladiator</h2>");
-  responseStream.println("<p><b>Puerta 1 (GPIO 26):</b> <a href=\"/r1/on\"><button class=\"btn\">Abrir Puerta 1</button></a></p>");
-  responseStream.println("<p><b>Puerta 2 (GPIO 27):</b> <a href=\"/r2/on\"><button class=\"btn\">Abrir Puerta 2</button></a></p>");
+  responseStream.printf("<p><b>Puerta %u (GPIO 26):</b> <a href=\"/r1/on\"><button class=\"btn\">Abrir Puerta %u</button></a></p>\n", PUERTA_RELE_1, PUERTA_RELE_1);
+  responseStream.printf("<p><b>Puerta %u (GPIO 27):</b> <a href=\"/r2/on\"><button class=\"btn\">Abrir Puerta %u</button></a></p>\n", PUERTA_RELE_2, PUERTA_RELE_2);
 
   responseStream.println("</body></html>");
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n[INICIO] ESP32 arrancando");
   digitalWrite(RELE1_PIN, HIGH);
   digitalWrite(RELE2_PIN, HIGH);
   pinMode(RELE1_PIN, OUTPUT);
   pinMode(RELE2_PIN, OUTPUT);
+  Serial.println("\n[INICIO] Gladiator | Controlador de puertas comunes");
+  Serial.printf("[INICIO] Dispositivo: %s | Puertas: %u y %u\n",
+                ESP32_DEVICE_ID, PUERTA_RELE_1, PUERTA_RELE_2);
+  Serial.println("[INICIO] Inicializando el sistema de apertura...");
   colaReles = xQueueCreate(8, sizeof(OrdenRele));
   if (colaReles == nullptr) {
     Serial.println("[PUERTAS] Error al crear la cola.");
@@ -323,6 +351,10 @@ void setup() {
   servidorLocal.begin();
   wsPuertas.onMessage(recibirOrdenBackend);
   wsPuertas.onEvent(eventoBackend);
+  wsPuertas.addHeader("Authorization", String("Bearer ") + APERTURA_READER_TOKEN);
+  if (strcmp(APERTURA_READER_TOKEN, "CONFIGURAR_TOKEN_APERTURA") == 0) {
+    Serial.println("[BACKEND] Configura APERTURA_READER_TOKEN antes de conectar al servidor.");
+  }
   if (xTaskCreate(tareaRedPuertas, "redPuertas", 8192, nullptr, 1, nullptr) != pdPASS) {
     Serial.println("[PUERTAS] Error al crear la tarea de red.");
   }
@@ -335,9 +367,9 @@ void loop() {
       Serial.println("[PUERTAS] Orden vencida; descartada.");
       continue;
     }
-    if (orden.puerta == 1) {
+    if (orden.puerta == PUERTA_RELE_1) {
       if (orden.abrir) activarPuerta1(); else desactivarPuerta1();
-    } else if (orden.puerta == 2) {
+    } else if (orden.puerta == PUERTA_RELE_2) {
       if (orden.abrir) activarPuerta2(); else desactivarPuerta2();
     }
   }
