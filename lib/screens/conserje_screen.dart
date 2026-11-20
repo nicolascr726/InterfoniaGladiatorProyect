@@ -856,7 +856,7 @@ class _ConserjeScreenState extends State<ConserjeScreen>
       isScrollControlled: true,
       useSafeArea: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => HorariosModal(miRut: miRut),
+      builder: (_) => HorariosModal(miRut: miRut, nombreUsuario: miNombre),
     );
   }
 

@@ -15,6 +15,7 @@ import '../helpers/call_notifications.dart';
 import '../helpers/incoming_call_dialog.dart';
 import 'login_screen.dart';
 import '../widgets/directorio_modal.dart';
+import '../widgets/horarios_modal.dart';
 import '../widgets/mensajes_modal.dart';
 import '../widgets/recados_modal.dart';
 import '../widgets/puertas_modal.dart';
@@ -22,7 +23,6 @@ import '../helpers/message_navigation.dart';
 import '../services/esp32_audio_bridge.dart';
 import '../services/notification_history_service.dart';
 import '../services/emergency_service.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 class ResidenteScreen extends StatefulWidget {
   const ResidenteScreen({super.key});
@@ -443,63 +443,13 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
     } catch (_) {}
   }
 
-  void _abrirConfigWifiEsp32() {
-    showDialog(
+  void _abrirHorarios() {
+    showModalBottomSheet<void>(
       context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: const Color(0xFF222233),
-        title: const Row(
-          children: [
-            Icon(Icons.wifi_find_rounded, color: Color(0xFF448AFF)),
-            SizedBox(width: 10),
-            Text('Configurar Wi-Fi Citófono', style: TextStyle(color: Colors.white, fontSize: 18)),
-          ],
-        ),
-        content: const Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '1. Mantén presionado el botón de tu citófono por 5 segundos hasta que parpadee.',
-              style: TextStyle(color: Colors.white70, fontSize: 14),
-            ),
-            SizedBox(height: 8),
-            Text(
-              '2. Conecta tu celular a la red Wi-Fi "Citofono-Config".',
-              style: TextStyle(color: Colors.white70, fontSize: 14),
-            ),
-            SizedBox(height: 8),
-            Text(
-              '3. Presiona "Abrir Portal" para guardar tu nueva clave de internet.',
-              style: TextStyle(color: Colors.white70, fontSize: 14),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
-          ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF448AFF)),
-            onPressed: () async {
-              Navigator.pop(context);
-              final uri = Uri.parse('http://192.168.4.1');
-              if (await canLaunchUrl(uri)) {
-                await launchUrl(uri, mode: LaunchMode.externalApplication);
-              } else {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Abre tu navegador e ingresa a http://192.168.4.1')),
-                  );
-                }
-              }
-            },
-            icon: const Icon(Icons.open_in_browser_rounded, color: Colors.white),
-            label: const Text('Abrir Portal (192.168.4.1)', style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => HorariosModal(miRut: miRut, nombreUsuario: miNombre),
     );
   }
 
@@ -899,9 +849,9 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
                                 ),
                               ),
                             ),
-                            // CARD 4: WI-FI ESP32
+                            // CARD 4: HORARIOS
                             InkWell(
-                              onTap: _abrirConfigWifiEsp32,
+                              onTap: _abrirHorarios,
                               borderRadius: BorderRadius.circular(20),
                               child: Container(
                                 padding: const EdgeInsets.all(16),
@@ -927,14 +877,14 @@ class _ResidenteScreenState extends State<ResidenteScreen> {
                                         color: const Color(0xFF0EA5E9).withOpacity(0.2),
                                         shape: BoxShape.circle,
                                       ),
-                                      child: const Icon(Icons.wifi_rounded, color: Color(0xFF0EA5E9), size: 24),
+                                      child: const Icon(Icons.calendar_month_rounded, color: Color(0xFF0EA5E9), size: 24),
                                     ),
                                     const Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        Text('Config Wi-Fi', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+                                        Text('Horarios', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
                                         SizedBox(height: 2),
-                                        Text('Soporte Citófono', style: TextStyle(fontSize: 11, color: Colors.white54)),
+                                        Text('Salidas y regresos', style: TextStyle(fontSize: 11, color: Colors.white54)),
                                       ],
                                     ),
                                   ],

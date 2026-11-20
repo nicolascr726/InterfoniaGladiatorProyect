@@ -8,9 +8,15 @@ import '../config.dart';
 
 class HorariosModal extends StatefulWidget {
   final String miRut;
+  final String nombreUsuario;
   final http.Client? client;
 
-  const HorariosModal({super.key, required this.miRut, this.client});
+  const HorariosModal({
+    super.key,
+    required this.miRut,
+    this.nombreUsuario = '',
+    this.client,
+  });
 
   @override
   State<HorariosModal> createState() => _HorariosModalState();
@@ -583,31 +589,48 @@ class _HorariosModalState extends State<HorariosModal> {
     ];
   }
 
-  Widget _lineaRegistro(String etiqueta, DateTime? fecha, IconData icono) =>
+  String _fechaHoraRegistro(DateTime? fecha) {
+    if (fecha == null) return 'Fecha no disponible';
+    final hora = _horaFormateada(TimeOfDay.fromDateTime(fecha));
+    return '${_fechaFormateada(fecha)} · $hora';
+  }
+
+  String _normalizarRut(String rut) =>
+      rut.replaceAll(RegExp(r'[.\s-]'), '').toUpperCase();
+
+  Widget _lineaRegistro(String etiqueta, String valor, IconData icono) =>
       Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Icon(icono, size: 18, color: _colorSecundario),
           const SizedBox(width: 10),
           Expanded(
-            child:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(etiqueta,
-                  style:
-                      const TextStyle(color: _colorSecundario, fontSize: 12)),
-              const SizedBox(height: 3),
-              Text(
-                  fecha == null
-                      ? 'Fecha no disponible'
-                      : '${_fechaFormateada(fecha)} · ${_horaFormateada(TimeOfDay.fromDateTime(fecha))}',
-                  style: const TextStyle(
-                      fontSize: 15, fontWeight: FontWeight.w500)),
-            ]),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(etiqueta,
+                    style: const TextStyle(
+                        color: _colorSecundario, fontSize: 12)),
+                const SizedBox(height: 3),
+                Text(valor,
+                    style: const TextStyle(
+                        fontSize: 15, fontWeight: FontWeight.w500)),
+              ],
+            ),
           ),
         ],
       );
 
   Widget _registro(Map<String, dynamic> horario) {
+    final departamento = horario['id_dpto']?.toString().trim() ?? '';
+    final rutCreador = horario['rut_usuario']?.toString().trim() ?? '';
+    final nombreUsuario = widget.nombreUsuario.trim();
+    var creador = rutCreador.isEmpty ? 'No identificado' : 'RUT $rutCreador';
+    if (rutCreador.isNotEmpty &&
+        nombreUsuario.isNotEmpty &&
+        _normalizarRut(rutCreador) == _normalizarRut(widget.miRut)) {
+      creador = nombreUsuario;
+    }
     final inicio = _fechaRegistro(horario['fecha_inicio']);
     final fin =
         _fechaRegistro(horario['fecha_regreso'] ?? horario['fecha_fin']);
@@ -641,12 +664,25 @@ class _HorariosModalState extends State<HorariosModal> {
                           color: _colorSecundario, fontSize: 13)),
               ]),
           const SizedBox(height: 16),
-          _lineaRegistro(_etiquetaInicio, inicio, Icons.logout_rounded),
+          _lineaRegistro(
+            'Departamento',
+            departamento.isEmpty ? 'No registrado' : departamento,
+            Icons.apartment_rounded,
+          ),
+          const SizedBox(height: 10),
+          _lineaRegistro('Creado por', creador, Icons.person_outline_rounded),
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 10),
             child: Divider(height: 1, color: _colorBorde),
           ),
-          _lineaRegistro(_etiquetaFin, fin, Icons.login_rounded),
+          _lineaRegistro(
+              _etiquetaInicio, _fechaHoraRegistro(inicio), Icons.logout_rounded),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: Divider(height: 1, color: _colorBorde),
+          ),
+          _lineaRegistro(
+              _etiquetaFin, _fechaHoraRegistro(fin), Icons.login_rounded),
           if (estado == 'En curso') ...[
             const SizedBox(height: 16),
             SizedBox(
